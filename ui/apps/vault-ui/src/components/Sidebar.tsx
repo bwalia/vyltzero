@@ -20,6 +20,8 @@ import {
   Server,
   UserCog,
   Smartphone,
+  Bot,
+  Boxes,
 } from 'lucide-react'
 
 const navGroups = [
@@ -29,6 +31,15 @@ const navGroups = [
       { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
       { href: '/secrets', label: 'Secrets', icon: Lock },
       { href: '/transit', label: 'Transit', icon: Cpu },
+    ],
+  },
+  {
+    // Agent access is the product's reason to exist, so it sits directly under
+    // the vault itself rather than buried in Access.
+    label: 'AI Agents',
+    items: [
+      { href: '/agents', label: 'Agents', icon: Bot },
+      { href: '/platforms', label: 'Platforms', icon: Boxes },
     ],
   },
   {

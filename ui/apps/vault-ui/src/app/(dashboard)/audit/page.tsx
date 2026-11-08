@@ -1,5 +1,5 @@
 'use client'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import useSWR from 'swr'
 import { useFetcher } from '@/hooks/useVaultSWR'
 import { PageHeader } from '@/components/ui/PageHeader'
@@ -47,6 +47,17 @@ export default function AuditPage() {
   const [filters, setFilters] = useState({ action: '', principal: '', from: '', to: '' })
   const [applied, setApplied] = useState({ action: '', principal: '', from: '', to: '' })
   const [selectedEvent, setSelectedEvent] = useState<AuditEvent | null>(null)
+
+  // Deep links (e.g. AI Agents → "Full history") arrive as /audit?action=… .
+  // Read once on mount instead of useSearchParams, which would need a Suspense
+  // boundary to prerender; the filter is ordinary client state from then on.
+  useEffect(() => {
+    const action = new URLSearchParams(window.location.search).get('action')
+    if (action) {
+      setFilters(f => ({ ...f, action }))
+      setApplied(a => ({ ...a, action }))
+    }
+  }, [])
 
   const { data, isLoading } = useSWR<AuditResponse>(buildUrl(applied), fetcher)
   const events = data?.events ?? []

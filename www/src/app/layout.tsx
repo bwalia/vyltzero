@@ -27,16 +27,22 @@ const jetbrainsMono = JetBrains_Mono({
 
 const SITE_URL = "https://www.vyltzero.com";
 const DESCRIPTION =
-  "VyltZero is an open-source, multi-region secrets manager: AES-256-GCM envelope encryption with a per-tenant key hierarchy, dynamic secrets and leases, transit encryption, PKI, self-service two-factor auth, and active/active cross-region replication — via CLI, SDKs, or a web console.";
+  "VYLTZERO is the vault for AI agents: workload identity and Kubernetes auth, short-lived agent session tokens, and an HTTP and MCP credential broker so agents act with delegated authority and never hold static keys — on a self-hosted, Rust-powered secrets platform with envelope encryption, transit, PKI, signed audit and multi-region replication.";
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
   title: {
-    default: "VyltZero — Secrets, encrypted per tenant, across regions",
+    default: "VYLTZERO — The Vault for AI Agents. Zero Keys. Agent Authority.",
     template: "%s · VyltZero",
   },
   description: DESCRIPTION,
   keywords: [
+    "AI agent security",
+    "agent credentials",
+    "MCP",
+    "credential broker",
+    "workload identity",
+    "zero trust",
     "secrets manager",
     "vault",
     "envelope encryption",
@@ -52,13 +58,13 @@ export const metadata: Metadata = {
   openGraph: {
     type: "website",
     url: SITE_URL,
-    title: "VyltZero — Secrets, encrypted per tenant, across regions",
+    title: "VYLTZERO — The Vault for AI Agents. Zero Keys. Agent Authority.",
     description: DESCRIPTION,
     siteName: "VyltZero",
   },
   twitter: {
     card: "summary_large_image",
-    title: "VyltZero — Secrets, encrypted per tenant, across regions",
+    title: "VYLTZERO — The Vault for AI Agents. Zero Keys. Agent Authority.",
     description: DESCRIPTION,
   },
   robots: { index: true, follow: true },
@@ -75,7 +81,7 @@ const GA_MEASUREMENT_ID = "G-JXX0FL4PEP";
 const structuredData = {
   "@context": "https://schema.org",
   "@type": "SoftwareApplication",
-  name: "VyltZero",
+  name: "VYLTZERO",
   applicationCategory: "SecurityApplication",
   operatingSystem: "Linux, Kubernetes",
   description: DESCRIPTION,

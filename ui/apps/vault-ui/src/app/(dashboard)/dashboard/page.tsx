@@ -12,7 +12,8 @@ import { EmptyState } from '@/components/ui/EmptyState'
 import { ErrorBanner, LoadError } from '@/components/ErrorBanner'
 import { CodeChip } from '@/components/ui/CodeChip'
 import { formatRelativeTime } from '@/lib/utils'
-import { Activity } from 'lucide-react'
+import Link from 'next/link'
+import { Activity, Bot, ArrowRight } from 'lucide-react'
 
 interface AuditEvent {
   event_id: string
@@ -55,6 +56,13 @@ export default function DashboardPage() {
   const { data: audit, error: auditError } = useVaultSWR<AuditResponse>(
     '/api/audit/v1/audit/events?limit=10',
   )
+  // Brokered AI-agent requests (agent-proxy). Same signed audit stream, filtered
+  // server-side on the exact action; the Agents page has the full picture.
+  const { data: agentAudit, error: agentError } = useVaultSWR<AuditResponse>(
+    '/api/audit/v1/audit/events?limit=100&action=agent_proxy.request',
+  )
+  const agentCalls = agentAudit?.events ?? []
+  const agentDenied = agentCalls.filter(e => e.outcome === 'failure').length
 
   // This is the landing page. Every stat previously fell back to an em-dash on
   // error, so a completely dead backend rendered as a healthy, empty vault —
@@ -70,7 +78,7 @@ export default function DashboardPage() {
     <div className="max-w-7xl space-y-6">
       <PageHeader
         title="Dashboard"
-        description="An overview of what is in your vault and what has happened recently."
+        description="The vault for AI agents — what is stored, which agents acted, and what happened recently."
         guide={
           <>
             <p>
@@ -119,7 +127,33 @@ export default function DashboardPage() {
             detail="values stored, all encrypted"
           />
         </motion.div>
+        <motion.div variants={staggerItem}>
+          <StatCard
+            label="Agent calls"
+            value={agentError ? '!' : agentAudit ? agentCalls.length : '—'}
+            detail={
+              agentAudit && agentDenied
+                ? `brokered, ${agentDenied} denied (last 100)`
+                : 'brokered by the agent-proxy (last 100)'
+            }
+          />
+        </motion.div>
       </motion.div>
+
+      <Link
+        href="/agents"
+        className="group flex items-center gap-4 rounded-xl border border-line bg-surface-2 px-5 py-4 transition-colors hover:border-[var(--brass)]"
+      >
+        <Bot className="h-5 w-5 shrink-0 text-[var(--brass)]" aria-hidden="true" />
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-semibold text-ink">Zero keys. Agent authority.</div>
+          <div className="text-xs text-ink-muted">
+            Agents sign in with workload identity, get a one-hour session token, and reach
+            APIs and MCP servers through the agent-proxy — never holding the real key.
+          </div>
+        </div>
+        <ArrowRight className="h-4 w-4 shrink-0 text-ink-faint transition-transform group-hover:translate-x-0.5" aria-hidden="true" />
+      </Link>
 
       <Card>
         <CardHeader>
