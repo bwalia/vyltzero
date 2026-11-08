@@ -1,0 +1,239 @@
+@import "tailwindcss";
+
+/* Class-based dark mode for Tailwind CSS v4 */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ---------------------------------------------------------------------------
+   Semantic surface/ink tokens.
+
+   Pages and components use `bg-surface`, `text-ink-muted`, `border-line` etc.
+   instead of hand-written `slate-XXX dark:slate-YYY` pairs — the variables
+   below flip with the `.dark` class, so every component is dark-mode-correct
+   by construction.
+--------------------------------------------------------------------------- */
+:root {
+  /* Canvas & surfaces (light: cool paper) */
+  --canvas:        #f6f7f9;
+  --surface:       #ffffff;
+  --surface-2:     #f1f3f6;
+  --surface-3:     #e9edf1;
+
+  /* Lines */
+  --line:          #dde2e9;
+  --line-strong:   #c2cad4;
+
+  /* Ink — every step ≥ 4.5:1 on surface AND surface-2 (verified) */
+  --ink:           #171a20;
+  --ink-muted:     #5a6472;
+  --ink-faint:     #66707e;
+
+  /* The sidebar is "vault steel" in BOTH themes — the app's signature. */
+  --steel:         #11161d;
+  --steel-raised:  #1a212b;
+  --steel-line:    #29323e;
+  --steel-ink:     #b7c0cc;
+  --steel-ink-dim: #828da0;
+
+  /* Brass: the lock on the door, and the thing you press.
+     Two roles, both deliberate — the vault mark and the primary action. A
+     product whose CTA is not its own colour looks assembled from parts, which
+     is exactly how the sign-in screen read with a brass vault beside a navy
+     button. Everything structural stays navy; brass is reserved for identity
+     and for action, never for decoration. */
+  --brass:         #c9a227;
+  --brass-dim:     #8a6f1a;
+}
+
+.dark {
+  --canvas:        #0c1014;
+  --surface:       #13181f;
+  --surface-2:     #1a2129;
+  --surface-3:     #222a34;
+
+  /* Lifted: at #242d37 a card edge was ~1.3:1 against its own surface, so
+     panels read as floating text rather than as compartments. */
+  --line:          #2c3743;
+  --line-strong:   #43515f;
+
+  /* Every step measured against BOTH --surface (#13181f) and --surface-2
+     (#1a2129), because faint text lands on both:
+
+       ink        14.8:1 / 13.5:1
+       ink-muted   7.9:1 /  7.2:1
+       ink-faint   6.7:1 /  6.1:1   (was 4.9 / 4.4 — AA only just, and only
+                                     for the larger sizes it was never used at)
+
+     ink-faint carries placeholders, counts and column headers. Those are
+     secondary, not optional: a count nobody can read is a count nobody has. */
+  --ink:           #e7eaee;
+  --ink-muted:     #a4aebc;
+  --ink-faint:     #94a0b3;
+
+  --steel:         #0e1319;
+  --steel-raised:  #171e27;
+  --steel-line:    #232c37;
+  --steel-ink:     #b7c0cc;
+  --steel-ink-dim: #828da0;
+
+  --brass:         #e3bd45;
+  --brass-dim:     #a98c22;
+}
+
+@theme inline {
+  --color-canvas:        var(--canvas);
+  --color-surface:       var(--surface);
+  --color-surface-2:     var(--surface-2);
+  --color-surface-3:     var(--surface-3);
+  --color-line:          var(--line);
+  --color-line-strong:   var(--line-strong);
+  --color-ink:           var(--ink);
+  --color-ink-muted:     var(--ink-muted);
+  --color-ink-faint:     var(--ink-faint);
+  --color-steel:         var(--steel);
+  --color-steel-raised:  var(--steel-raised);
+  --color-steel-line:    var(--steel-line);
+  --color-steel-ink:     var(--steel-ink);
+  --color-steel-ink-dim: var(--steel-ink-dim);
+  --color-brass:         var(--brass);
+  --color-brass-dim:     var(--brass-dim);
+}
+
+@theme {
+  /* Primary — "vault navy". The colour of a safe door, not a stock indigo.
+     600 on white = 4.8:1; 300 on dark surfaces = 7.6:1. Verified, not guessed. */
+  --color-primary-50:  #f0f5fa;
+  --color-primary-100: #dde9f4;
+  --color-primary-200: #c0d6ea;
+  --color-primary-300: #94badb;
+  --color-primary-400: #6199c8;
+  --color-primary-500: #3f7cb2;
+  --color-primary-600: #2e6296;
+  --color-primary-700: #27507a;
+  --color-primary-800: #1e3a5f;
+  --color-primary-900: #1b3252;
+  --color-primary-950: #122237;
+
+  /* Accent — "unlocked green". Reserved for the moment something opens or
+     succeeds, so it keeps its meaning; never used as decoration. */
+  --color-accent-50:  #ecfdf5;
+  --color-accent-100: #d1fae5;
+  --color-accent-200: #a7f3d0;
+  --color-accent-300: #6ee7b7;
+  --color-accent-400: #34d399;
+  --color-accent-500: #10b981;
+  --color-accent-600: #059669;
+  --color-accent-700: #047857;
+  --color-accent-800: #065f46;
+  --color-accent-900: #064e3b;
+
+  /* Status — functional, reserved for state (never decoration). */
+  --color-success-50:  #ecfdf3;
+  --color-success-100: #d1fadf;
+  --color-success-500: #12a150;
+  --color-success-600: #0d8544;
+  --color-success-700: #0b6a38;
+
+  --color-danger-50:  #fef2f2;
+  --color-danger-100: #fee2e2;
+  --color-danger-400: #f87171;
+  --color-danger-500: #ef4444;
+  --color-danger-600: #dc2626;
+  --color-danger-700: #b91c1c;
+
+  --color-warn-50:  #fffaeb;
+  --color-warn-100: #fdefc8;
+  --color-warn-500: #e79008;
+  --color-warn-600: #a35c04;
+  --color-warn-700: #7d4603;
+
+  /* Back-compat: a handful of pages still reference accent-* (= success). */
+  --color-accent-50:  #ecfdf3;
+  --color-accent-100: #d1fadf;
+  --color-accent-500: #12a150;
+  --color-accent-600: #0d8544;
+  --color-accent-700: #0b6a38;
+
+  /* ---------------------------------------------------------------------
+     Type scale — matched to workstation-website (15px body, Poppins/Unbounded).
+
+     Override Tailwind defaults so the console and marketing site share one
+     reading size. Spacing stays on Tailwind's default rem scale.
+     --------------------------------------------------------------------- */
+  --text-xs:   0.8rem;      /* ~12.8px — meta, labels */
+  --text-xs--line-height:   1.5;
+  --text-sm:   0.9rem;      /* ~14.4px — table cells, hints */
+  --text-sm--line-height:   1.55;
+  --text-base: 0.9375rem;   /* 15px — body (workstation) */
+  --text-base--line-height: 1.7;
+  --text-lg:   1.125rem;    /* 18px */
+  --text-lg--line-height:   1.55;
+  --text-xl:   1.25rem;     /* 20px */
+  --text-xl--line-height:   1.5;
+  --text-2xl:  1.5rem;      /* 24px */
+  --text-2xl--line-height:  1.35;
+  --text-3xl:  1.875rem;    /* 30px */
+  --text-3xl--line-height:  1.25;
+
+  --font-sans: var(--font-sans), "Poppins", "Helvetica Neue", Arial, sans-serif;
+  /* Headings / brand chrome — Unbounded, same as workstation-website. */
+  --font-display: var(--font-display), "Unbounded", "Poppins", sans-serif;
+  --font-mono: var(--font-plex-mono), "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+@layer base {
+  html { @apply antialiased; }
+
+  body {
+    @apply bg-canvas text-ink text-base;
+    font-family: var(--font-sans), "Poppins", "Helvetica Neue", Arial, sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+    letter-spacing: 0;
+  }
+
+  h1, h2, h3 {
+    letter-spacing: -0.02em;
+  }
+
+  /* Placeholders are a hint, not content — dimmer than a real value, but still
+     legible. Set once here so no input has to remember it. */
+  ::placeholder { color: var(--ink-faint); opacity: 1; }
+
+  /* Autofill.
+     Chrome paints its own near-white background on an autofilled field and
+     will not let `background-color` override it — so a saved API key rendered
+     as a white slab in the middle of a dark form, which reads as a rendering
+     fault rather than as a convenience. The inset shadow is the documented way
+     round it: it covers the browser's fill without touching the property the
+     browser is defending. The long transition keeps it covered, because the
+     fill is re-applied on a delay after the field is touched. */
+  input:-webkit-autofill,
+  input:-webkit-autofill:hover,
+  input:-webkit-autofill:focus,
+  textarea:-webkit-autofill,
+  select:-webkit-autofill {
+    -webkit-text-fill-color: var(--ink);
+    -webkit-box-shadow: 0 0 0 1000px var(--surface) inset;
+    box-shadow: 0 0 0 1000px var(--surface) inset;
+    caret-color: var(--ink);
+    transition: background-color 100000s ease-in-out 0s;
+  }
+
+  /* Counts, sizes, and durations line up in tables. */
+  .tabular { font-variant-numeric: tabular-nums; }
+
+  ::selection { @apply bg-primary-200 text-primary-950; }
+  .dark ::selection { @apply bg-primary-800 text-primary-50; }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { @apply bg-transparent; }
+  ::-webkit-scrollbar-thumb { @apply bg-line-strong rounded-full; }
+  ::-webkit-scrollbar-thumb:hover { @apply bg-ink-faint; }
+}
+
+@layer utilities {
+  .focus-ring {
+    @apply focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-500/60 focus-visible:ring-offset-2 focus-visible:ring-offset-surface;
+  }
+}

@@ -1,0 +1,857 @@
+# -- Global configuration applied across all services
+global:
+  # -- Default image tag for all vyltzero services (overridden per-service with image.tag)
+  imageTag: "0.1.0"
+  # -- Default image pull policy
+  imagePullPolicy: IfNotPresent
+  # -- Image pull secrets for private registries
+  imagePullSecrets: []
+  # -- Target namespace (used in NetworkPolicy cross-namespace selectors)
+  namespace: vyltzero
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Region identity — what makes this release one member of an HA mesh.
+  #
+  # A "region" is one complete, self-contained vyltzero release: its own
+  # PostgreSQL, its own service set, its own public edge hostname. Two regions
+  # deployed from this same chart with different `id`s, listing each other
+  # under `peers`, form the active/active pair: each region's
+  # replication-agent polls the other's /v1/replication/events and applies the
+  # events locally with the configured conflict strategy.
+  #
+  # Peering goes over PUBLIC URLs, not cluster DNS. Edge PoP nodes carry
+  # network.k3s1/cross-node=unavailable, so pods in one region have no
+  # pod-network route to pods in another; the traffic leaves the cluster and
+  # re-enters through the peer's ingress.
+  #
+  # `peers` is the full roster INCLUDING this region — the chart filters the
+  # local entry out — so every region's values file can carry one identical
+  # list and adding a third region is a single edit in one place.
+  # ──────────────────────────────────────────────────────────────────────────
+  region:
+    # -- Stable, mesh-unique region identifier. Stamped onto every replication
+    # event, vector-clock entry and system.regions row, so changing it on a
+    # live region orphans that region's replication state. Required.
+    # These defaults describe the FIRST region, matching the cloud001 pinning
+    # and vault.workstation.co.uk host also defaulted in this file. Per-region
+    # values files under deploy/gitops/regions/ override every field.
+    id: "region-a"
+    # -- Human-readable name shown in the regions API; defaults to id
+    displayName: "Region A"
+    # -- How peers address THIS region. Defaults to https://<edgeIngress.host>
+    endpoint: ""
+    # -- Full region roster. Each entry: {id, displayName, replicationUrl}
+    # replicationUrl is the peer's base URL; the agent appends
+    # /v1/replication/events to it.
+    peers: []
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Node placement — THE single place to (re)pin the whole stack.
+  #
+  # Every workload in this chart (all services, vault-ui, and the PostgreSQL
+  # subchart via the YAML anchors below) inherits these defaults unless a
+  # per-service nodeSelector/affinity/tolerations is set explicitly.
+  #
+  # To move the stack to a different node, change ONLY this block:
+  #   1. nodeSelector hostname  -> the new node's kubernetes.io/hostname
+  #   2. tolerations            -> keep/adjust for the new node's taints
+  #   3. edgeHostCidrs          -> the new node's flannel host /31, derived
+  #      from `kubectl get node <node> -o jsonpath='{.spec.podCIDR}'`
+  #      (e.g. podCIDR 10.42.16.0/24 -> 10.42.16.0/31); used by the
+  #      wslproxy/edge host-ingress NetworkPolicies further down (wired with
+  #      YAML anchors so no other edit is needed).
+  #
+  # cloud001 is the public edge PoP origin (taint node-role.kubernetes.io/edge)
+  # and pods on it cannot reach pods on other nodes (flannel VXLAN to the LAN
+  # nodes is unroutable — node label network.k3s1/cross-node=unavailable), so
+  # the entire release MUST be co-scheduled on the same node.
+  # ──────────────────────────────────────────────────────────────────────────
+  scheduling:
+    # -- Default nodeSelector for every pod in the release
+    nodeSelector: &vyltzeroNodeSelector
+      kubernetes.io/hostname: cloud001
+    # -- Default tolerations (cloud001 carries the edge NoSchedule taint;
+    # harmless when pinning to an untainted node)
+    tolerations: &vyltzeroTolerations
+      - key: node-role.kubernetes.io/edge
+        operator: Exists
+        effect: NoSchedule
+    # -- Default affinity for every pod in the release
+    affinity: {}
+  # -- Flannel host /31 of the pinned node (see the placement notes above)
+  edgeHostCidrs: &vyltzeroEdgeHostCidrs
+    - 10.42.16.0/31  # cloud001
+
+# -- Service account creation and RBAC configuration
+serviceAccount:
+  # -- Whether to create a shared service account
+  create: true
+  # -- Annotations to add to the service account
+  annotations: {}
+  # -- Override the default service account name
+  name: ""
+
+# -- RBAC resource creation
+rbac:
+  # -- Whether to create RBAC roles and bindings
+  create: true
+
+# -- NetworkPolicy creation
+networkPolicies:
+  # -- Whether to create NetworkPolicy resources (default deny + explicit allow rules)
+  enabled: true
+  # -- Host-network wslproxy / traefik-edge instances (the public PoP's origin
+  # hop on cluster nodes) allowed to reach the public API service ports
+  # directly via pod IPs. Follows global.edgeHostCidrs so re-pinning the stack
+  # updates this automatically. Empty cidrs renders no policy.
+  wslproxyHostIngress:
+    cidrs: *vyltzeroEdgeHostCidrs
+    # -- Public API HTTP ports (mirrors the edgeIngress route map):
+    # secret-engine, identity-service, policy-engine, transit-engine,
+    # mcp-server, pki-engine, and replication-agent (8091) for peer pulls.
+    # traefik-edge is host-networked, so its source is the node's flannel host
+    # address rather than a pod IP — hence the cidr carve-out rather than a
+    # podSelector.
+    ports: [8081, 8082, 8083, 8084, 8086, 8087, 8088, 8091, 8092]
+  # -- Destination ports the replication-agent and region-health may reach on
+  # peer regions. Egress is opened to public address space only (RFC1918 and
+  # link-local are excluded) and only when global.region.peers is non-empty.
+  crossRegionEgressPorts: [443, 80]
+
+# -- Schema bootstrap. Applies deploy/helm/vyltzero/files/migrations/*.sql to
+# this region's database through a ledger table (system.schema_migrations), so
+# each numbered file runs exactly once and a fresh region comes up with a
+# complete schema instead of crash-looping on missing tables. See
+# templates/migrations.yaml for the full rationale.
+migrations:
+  # -- Run the schema bootstrap Job. Disable only when the schema is managed
+  # entirely out-of-band.
+  enabled: true
+  image:
+    # -- Needs psql and pg_isready; any postgres client image works
+    repository: postgres
+    tag: "16-alpine"
+  # -- Record existing files as applied, without executing them, when the
+  # database already carries the schema but has no ledger. This is what lets
+  # the Job be introduced safely on a region that was migrated by hand.
+  # Set false to make that situation a hard failure instead.
+  baselineOnExisting: true
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 86400
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# -- vault-ui: Next.js web console. When enabled it is
+# deployed with a Service, Ingress, and the additive NetworkPolicies it needs to
+# reach the backends over in-cluster DNS. Point ui.host's DNS at the same edge.
+ui:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: bwalia/vyltzero-vault-ui
+    # -- Leave empty to use global.imageTag
+    tag: ""
+  port: 3011
+  host: vault-ui.workstation.co.uk
+  # -- Additional hostnames the UI Ingress answers, e.g. to keep an old name
+  # working across a rename. Each needs the same DNS + PoP routing as `host`.
+  extraHosts: []
+  # -- Overrides the release version the footer shows (/api/version). Leave
+  # empty: images built by CI bake the computed vX.Y.Z; set this only when a
+  # pinned image predates that scheme.
+  appVersion: ""
+  # -- traefik-edge is the host-network Traefik daemonset on the edge nodes
+  # (:443 on the pinned node). With the stack pinned to cloud001 the LAN
+  # Traefik LB can no longer reach these pods, so the edge node serves the
+  # public hostnames itself; the PoP origin must point at the pinned node.
+  ingressClassName: traefik-edge
+  # -- traefik-edge terminates no TLS for these hosts (the PoP holds the public
+  # certificate and proxies to the web entrypoint), so the router must bind :80.
+  entrypoint: web,websecure
+  tls:
+    # -- Leave secretName empty to serve HTTP only (TLS terminated at the edge PoP)
+    secretName: ""
+  # -- Host-network wslproxy instances allowed to reach the UI port directly
+  # (bypassing Traefik). Follows global.edgeHostCidrs — with the whole stack
+  # pinned to one node, only that node's wslproxy can reach the UI pod anyway.
+  # Empty list renders no policy; the default-deny then blocks host traffic.
+  wslproxyIngress:
+    cidrs: *vyltzeroEdgeHostCidrs
+  resources: {}
+  # -- Optional per-service overrides of global.scheduling
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# -- Edge Ingress for the control plane (Traefik / k3s). Chart-managed
+# equivalent of deploy/k8s/vyltzero-ingress.yaml — enable exactly ONE of the two
+# (this template OR the raw manifest) to avoid duplicate Ingress objects.
+# The route map is verified against the actual axum route registrations in
+# services/*/src; only prefixes a backend truly serves over HTTP are listed.
+edgeIngress:
+  enabled: true
+  # -- See ui.ingressClassName: the pinned edge node serves the API hosts.
+  ingressClassName: traefik-edge
+  # -- See ui.entrypoint: PoP terminates TLS, origin hop uses the web entrypoint.
+  entrypoint: web,websecure
+  host: vault.workstation.co.uk
+  # -- Additional hostnames served with the same route map. Use this for the
+  # per-region host (vault-a…/vault-b…) alongside the shared alias, so the
+  # public alias can be repointed at another region without a chart change.
+  # Every name here should also appear under tls.hosts.
+  extraHosts: []
+  tls:
+    # -- Self-signed by default; SANs must cover every host below. Point this at
+    # a cert-manager-issued secret for a trusted chain.
+    secretName: vyltzero-gateway-tls
+    hosts:
+      - vault.workstation.co.uk
+      - vyltzero.workstation.co.uk
+  # -- HTTP:80 -> HTTPS 308 redirect (Traefik redirectScheme middleware).
+  # Disabled: traefik-edge runs without the kubernetescrd provider, so the
+  # Middleware CRD reference cannot resolve there.
+  httpRedirect:
+    enabled: false
+    entrypoint: web
+  # -- path -> component:port. Verified 2026-07-13 against source routes.
+  # Deliberately omitted (no HTTP backend): /v1/identity (unimplemented),
+  # /v1/audit (gRPC-only). /healthz + /readyz map to secret-engine.
+  routes:
+    - { path: /healthz, component: secret-engine, port: 8081 }
+    - { path: /readyz, component: secret-engine, port: 8081 }
+    - { path: /v1/auth, component: identity-service, port: 8082 }
+    - { path: /v1/tenants, component: identity-service, port: 8082 }
+    - { path: /v1/api-keys, component: identity-service, port: 8082 }
+    - { path: /v1/quotas, component: identity-service, port: 8082 }
+    - { path: /scim, component: identity-service, port: 8082 }
+    - { path: /v1/secret, component: secret-engine, port: 8081 }
+    # HashiCorp Vault KV v2 compatibility mount (services/secret-engine/src/kv2.rs).
+    # This is what the External Secrets Operator talks to: `path: kv` in its
+    # SecretStore maps to GET/POST /v1/kv/data/<path>.
+    - { path: /v1/kv, component: secret-engine, port: 8081 }
+    # Vault clients probe token self-lookup before use. This MUST stay a longer
+    # prefix than /v1/auth above (which goes to identity-service) — Traefik
+    # prefers the more specific match, so /v1/auth/token lands on secret-engine
+    # while the rest of /v1/auth still reaches identity-service.
+    - { path: /v1/auth/token, component: secret-engine, port: 8081 }
+    # Vault-shaped health (/v1/sys/health), used by vault clients and probes.
+    - { path: /v1/sys, component: secret-engine, port: 8081 }
+    # The multi-region views live on region-health, NOT secret-engine. These
+    # MUST stay longer prefixes than /v1/sys above — Traefik prefers the more
+    # specific match, so /v1/sys/regions lands on region-health while the rest
+    # of /v1/sys (notably /v1/sys/health) still reaches secret-engine.
+    # Without them the vault-ui Regions and Cluster pages 404, and so does the
+    # `curl .../v1/sys/regions` in docs/ha-two-region.md.
+    - { path: /v1/sys/regions, component: region-health, port: 8092 }
+    - { path: /v1/sys/cluster, component: region-health, port: 8092 }
+    - { path: /v1/transit, component: transit-engine, port: 8086 }
+    - { path: /v1/policies, component: policy-engine, port: 8083 }
+    - { path: /v1/pki, component: pki-engine, port: 8088 }
+    - { path: /v1/mcp, component: mcp-server, port: 8087 }
+    - { path: /v1/leases, component: lease-manager, port: 8084 }
+
+# -- Prometheus monitoring annotations
+monitoring:
+  # -- Annotate pods with prometheus.io/scrape, path, and port
+  enabled: true
+  scrapeAnnotations:
+    "prometheus.io/scrape": "true"
+    "prometheus.io/path": "/metrics"
+
+# -- Secrets injected as Kubernetes Secret objects
+secrets:
+  # -- Root encryption key for the vault (base64-encoded 32-byte key recommended)
+  rootKey: ""
+  # -- JWT signing secret for identity-service token issuance
+  jwtSecret: ""
+  # -- PKI root key that envelope-encrypts tenant CA private keys (base64-encoded 32-byte key)
+  pkiRootKey: ""
+  # -- Master key for the audit signing chain; per-tenant signing keys derive
+  # from it, and audit-service refuses to start without one. At least 32
+  # bytes. Generate with: openssl rand -base64 48
+  auditSigningKey: ""
+  # -- Bootstrap administrator token for the API key management endpoints
+  # (VAULT_ADMIN_TOKEN). Creating an API key grants whatever policies the
+  # request asks for, so those endpoints authenticate callers themselves rather
+  # than trusting the network in front of them. This token is the way to mint
+  # the FIRST key of a deployment, before any JWT exists to present; after that,
+  # a JWT carrying the administrator policy works too. Leave empty to disable
+  # the bootstrap path entirely (JWT-only). Generate with: openssl rand -hex 32
+  adminToken: ""
+  # -- SMTP password for tenant invitation emails. Optional: without it,
+  # invitations are still created and the link is returned for the operator to
+  # deliver by hand. For Gmail this must be an APP PASSWORD (2-Step
+  # Verification on) — an account password is rejected with SMTP 535.
+  #
+  # Prefer supplying this through secrets.existingSecret and an external secret
+  # manager. A value written here reaches the release manifest, `helm get
+  # values`, and whatever repository the values file lives in.
+  smtpPassword: ""
+  # -- Deliver the three keys above from a Secret provisioned out-of-band
+  # (SealedSecret, ExternalSecret, …) instead of from these values. REQUIRED in
+  # a multi-region mesh: replicated ciphertext is decrypted with the receiving
+  # region's root key and a token minted in one region is verified in another,
+  # so all regions must hold byte-identical material. Setting this skips
+  # creation of the chart-managed key Secrets entirely.
+  existingSecret: ""
+  # -- Key names inside existingSecret
+  existingSecretKeys:
+    rootKey: root-key
+    jwtSecret: jwt-secret
+    pkiRootKey: pki-root-key
+    replicationPeerToken: replication-peer-token
+    auditSigningKey: audit-signing-key
+    # Optional: absent from existingSecret means the bootstrap path stays off.
+    adminToken: admin-token
+    smtpPassword: smtp-password
+
+# -- crypto-service: AES-GCM and ChaCha20 encryption primitives
+cryptoService:
+  enabled: true
+  # -- MUST stay 1 until DEK lookups are served from the DB on-demand. The
+  # service restores wrapped keys from Postgres only at startup and otherwise
+  # serves DEKs from an in-process cache, so with >1 replica an encrypt on one
+  # pod and the matching decrypt on another fails with "key not found".
+  replicaCount: 1
+  image:
+    repository: bwalia/vyltzero-crypto-service
+    # -- Leave empty to use global.imageTag
+    tag: ""
+  # -- HTTP port for REST and health endpoints
+  httpPort: 8080
+  # -- gRPC port for inter-service calls
+  grpcPort: 50051
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  # -- Extra environment variables injected into the container
+  extraEnv: []
+  autoscaling:
+    enabled: false
+    minReplicas: 3
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+# -- secret-engine: core secret storage and retrieval engine
+secretEngine:
+  enabled: true
+  replicaCount: 3
+  image:
+    repository: bwalia/vyltzero-secret-engine
+    tag: ""
+  httpPort: 8081
+  grpcPort: 50052
+  resources:
+    requests:
+      cpu: "150m"
+      memory: "256Mi"
+    limits:
+      cpu: "750m"
+      memory: "512Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  extraEnv: []
+  autoscaling:
+    enabled: false
+    minReplicas: 3
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+# -- policy-engine: RBAC policy evaluation and enforcement
+policyEngine:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: bwalia/vyltzero-policy-engine
+    tag: ""
+  httpPort: 8083
+  grpcPort: 50053
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  extraEnv: []
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+# -- identity-service: authentication, JWT issuance, and tenant management
+identityService:
+  enabled: true
+  # -- MUST stay 1 until the principal store is persisted. API keys now live in
+  # `shared.api_keys` and survive restarts and replicas, but `PrincipalStore`
+  # (store.rs) is still an in-process HashMap, so a principal registered on one
+  # pod is invisible to the others.
+  replicaCount: 1
+  image:
+    repository: bwalia/vyltzero-identity-service
+    tag: ""
+  httpPort: 8082
+  grpcPort: 50054
+  # -- Policy a JWT must carry to manage API keys (tenants + api-keys admin
+  # endpoints the dashboard reads). Empty falls back to the service's compiled
+  # default, which is "vyltzero:platform-admin" — but every key issued in this
+  # deployment carries the legacy {root, admin, default} set and none carry
+  # platform-admin, so an empty value makes the dashboard 401 with
+  # "admin credential required". Pin it to "admin", a policy the operator keys
+  # actually hold. The bootstrap token in secrets.adminToken bypasses this and
+  # is the only way to mint the first key.
+  # -- Policy a JWT must carry to manage tenants and API keys. Empty uses the
+  # compiled default, `vyltzero:platform-admin`, which is what you want.
+  #
+  # This was pinned to "admin" because no key carried the namespaced policy and
+  # an empty value 401'd the dashboard. The cost was severe: `admin` is the
+  # most likely name a tenant gives its OWN administrators, so any tenant that
+  # created one was handing its staff authority over every tenant in the
+  # deployment. Migration 033 grants `vyltzero:platform-admin` to the real
+  # operator keys (those carrying `root`, and superusers), which is what allows
+  # this to be empty again.
+  #
+  # Do not set this back to "admin". If an operator is locked out, the
+  # bootstrap token (X-Admin-Token) is not policy-gated and can grant the
+  # namespaced policy to the right keys.
+  adminPolicy: ""
+  # -- Base address tenant invitation links point at, e.g.
+  # "https://vault.workstation.co.uk". Must be an address the recipient can
+  # actually open; the service cannot infer it, and a wrong value produces
+  # links that reach nobody. Empty falls back to a localhost default that is
+  # only correct for local development.
+  publicUrl: ""
+  # -- Outbound email for tenant invitations. Leave host empty to disable
+  # sending: invitations are still created and their link returned to the
+  # operator to deliver by hand. The password is NOT set here — it comes from
+  # secrets.smtpPassword or secrets.existingSecret.
+  smtp:
+    host: ""
+    port: 587
+    username: ""
+    # -- Envelope sender, e.g. "VyltZero <vault@example.com>". Defaults to
+    # username when empty.
+    from: ""
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  extraEnv: []
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+# -- lease-manager: secret lease lifecycle and renewal
+leaseManager:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: bwalia/vyltzero-lease-manager
+    tag: ""
+  httpPort: 8084
+  grpcPort: 50055
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  extraEnv: []
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+# -- audit-service: immutable audit log ingestion and query
+auditService:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: bwalia/vyltzero-audit-service
+    tag: ""
+  httpPort: 8085
+  grpcPort: 50056
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  extraEnv: []
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+# -- transit-engine: encryption-as-a-service (no persistent secrets stored)
+transitEngine:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: bwalia/vyltzero-transit-engine
+    tag: ""
+  httpPort: 8086
+  # -- transit-engine does not expose a gRPC port
+  resources:
+    requests:
+      cpu: "150m"
+      memory: "128Mi"
+    limits:
+      cpu: "750m"
+      memory: "256Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  extraEnv: []
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+# -- pki-engine: internal certificate authority (per-tenant CAs, cert issuance, CRL)
+pkiEngine:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: bwalia/vyltzero-pki-engine
+    tag: ""
+  httpPort: 8088
+  # -- pki-engine does not expose a gRPC port
+  resources:
+    requests:
+      cpu: "150m"
+      memory: "128Mi"
+    limits:
+      cpu: "750m"
+      memory: "256Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  extraEnv: []
+
+# -- mcp-server: Model Context Protocol integration server (single replica by design)
+mcpServer:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: bwalia/vyltzero-mcp-server
+    tag: ""
+  httpPort: 8087
+  # -- mcp-server does not expose a gRPC port
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  extraEnv: []
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 70
+
+# -- agent-proxy: credential broker for AI agents (docs/agent-proxy.md).
+# Agents hold a short-lived vyltzero session token and NO upstream keys; the
+# proxy injects the real credential, read with its own Kubernetes-auth identity.
+agentProxy:
+  enabled: false
+  replicaCount: 2
+  image:
+    repository: bwalia/vyltzero-agent-proxy
+    tag: ""
+  httpPort: 8094
+  # -- identity-service Kubernetes auth role (VAULT_K8S_ROLES) bound to the
+  # agent-proxy ServiceAccount. Its policy must grant read on the brokered
+  # secret paths; agent roles must NOT.
+  k8sRole: agent-proxy
+  # -- Optional audience for the projected SA token used for Kubernetes auth.
+  k8sTokenAudience: ""
+  # -- How long a brokered credential is cached before re-reading (seconds).
+  secretTtlSeconds: 60
+  # -- Namespaces whose pods may call the proxy (matched on namespace labels).
+  # Empty = only pods in the release namespace.
+  agentNamespaceSelector: {}
+  #  matchLabels:
+  #    vyltzero.io/agent-sandbox: "true"
+  # -- Upstream egress allowed from the proxy (TCP 443). Private ranges are
+  # excluded so a route cannot be pointed at in-cluster services.
+  egressCidrs:
+    - cidr: 0.0.0.0/0
+      except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10]
+  # -- Route table; see services/agent-proxy/src/config.rs for the schema.
+  routes: {}
+  #  anthropic:
+  #    upstream: https://api.anthropic.com
+  #    hosts: [api.anthropic.com]
+  #    allowed_policies: [agent-claude]
+  #    secret_path: brokered/anthropic
+  #    secret_key: api_key
+  #    inject_header: x-api-key
+  #  github:
+  #    upstream: https://api.github.com
+  #    hosts: [api.github.com]
+  #    allowed_policies: [agent-claude]
+  #    secret_path: brokered/github
+  #    secret_key: token
+  #    inject_header: authorization
+  #    inject_format: "Bearer {secret}"
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  extraEnv: []
+
+# -- gateway: OpenResty TLS termination and reverse proxy
+gateway:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: openresty/openresty
+    tag: "1.25.3.2-alpine"
+  httpsPort: 443
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  extraEnv: []
+  # -- TLS certificate secret name (must exist in the same namespace)
+  tls:
+    secretName: "vyltzero-gateway-tls"
+  service:
+    type: LoadBalancer
+    annotations: {}
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+
+# -- replication-agent: cross-region secret, policy, and tenant replication
+replicationAgent:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: bwalia/vyltzero-replication-agent
+    # -- Leave empty to use global.imageTag
+    tag: ""
+  # -- HTTP port for replication API, health probes, and Prometheus metrics
+  httpPort: 8091
+  # -- Milliseconds between peer polls
+  pollIntervalMs: 500
+  # -- Maximum events to fetch per poll batch
+  batchSize: 100
+  # -- Conflict resolution strategy: "last_write_wins", "vector_clock", or "manual"
+  conflictStrategy: "last_write_wins"
+  # -- Publish /v1/replication on the edge Ingress so peer regions can pull the
+  # outbox.
+  #
+  # ⚠ KEEP THIS false UNTIL THE DEPLOYED IMAGE ENFORCES THE PEER TOKEN.
+  # The outbox serves ciphertext and DEK ids, cleartext RBAC policy documents,
+  # and the tenant roster including root_key_id. The shared-token guard lives in
+  # services/replication-agent/src/auth.rs, but a published image built BEFORE
+  # that change ignores REPLICATION_PEER_TOKEN entirely and serves the outbox to
+  # anyone who can reach the ingress — the env var being present proves nothing.
+  #
+  # Confirm the running image enforces it before flipping this on:
+  #   curl -o /dev/null -w '%{http_code}\n' \
+  #     "https://<region-host>/v1/replication/events?source_region=x"
+  #   # 401 (or 503) = guarded and safe to publish
+  #   # 200          = pre-auth image; leave this false
+  #
+  # Regions cannot replicate while this is false; that is the safe failure.
+  publishPeerEndpoint: false
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  # -- Extra env vars (e.g. REPLICATION_PEERS for wiring peer URLs)
+  extraEnv: []
+
+# -- region-health: multi-region health monitor and failover coordinator
+regionHealth:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: bwalia/vyltzero-region-health
+    tag: ""
+  # -- HTTP port for health API and Prometheus metrics
+  httpPort: 8092
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  extraEnv: []
+
+# -- sync-scheduler: scheduled sync with external secret managers
+syncScheduler:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: bwalia/vyltzero-sync-scheduler
+    tag: ""
+  # -- HTTP port for status API and health probes
+  httpPort: 8093
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  extraEnv: []
+
+# -- Bitnami PostgreSQL subchart configuration
+# See: https://github.com/bitnami/charts/tree/main/bitnami/postgresql
+postgresql:
+  # -- Deploy PostgreSQL as part of this release; set to false to use an external database
+  enabled: true
+  auth:
+    # -- PostgreSQL database name
+    database: vyltzero
+    # -- PostgreSQL superuser username
+    username: vyltzero
+    # -- PostgreSQL password (set a strong value in production; prefer existingSecret)
+    password: "changeme"
+    # -- Use an existing secret for credentials instead of the above plain-text values
+    existingSecret: ""
+    secretKeys:
+      adminPasswordKey: postgres-password
+      userPasswordKey: password
+  primary:
+    persistence:
+      enabled: true
+      size: 10Gi
+      # -- Node-local storage: the pinned node keeps its own data and the
+      # DB never depends on cross-node replica traffic (broken from cloud001).
+      # NOTE: this field lands in the StatefulSet volumeClaimTemplates, which
+      # are immutable — changing it requires deleting the StatefulSet + PVC
+      # (dump/restore the data) before upgrading.
+      storageClass: local-path
+    # -- The Bitnami subchart cannot read global.scheduling, so the placement
+    # anchors from the global block are referenced here explicitly. No edit
+    # needed when re-pinning — the anchors resolve to the same single source.
+    nodeSelector: *vyltzeroNodeSelector
+    tolerations: *vyltzeroTolerations
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "256Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+  # -- Least-privilege role the SERVICES connect as, so that row-level security
+  # actually applies to them.
+  #
+  # Leave username empty (the default) and every service connects as
+  # postgresql.auth.username — the role that OWNS the schema. PostgreSQL exempts
+  # a table's owner from its own RLS policies, which is why the policies added in
+  # migration 004 and corrected in 018/029 have never constrained anything.
+  #
+  # To turn enforcement on:
+  #   1. Create the role once per region, as a superuser:
+  #        psql -U postgres -d vyltzero \
+  #             -v app_password="$(openssl rand -base64 32)" \
+  #             -f deploy/helm/vyltzero/files/bootstrap/rls_app_role.sql
+  #   2. Put that password in the DB credentials secret under `passwordKey`.
+  #   3. Set username below and redeploy.
+  #
+  # Do NOT do step 3 before the services are running a build that opens tenant
+  # scopes (vyltzero_storage::tenant_scope) — the policies fail closed, so an
+  # unscoped service sees zero rows rather than erroring, which looks like an
+  # empty vault rather than a misconfiguration.
+  appRole:
+    # -- e.g. "vyltzero_app". Empty means "connect as the schema owner".
+    username: ""
+    # -- Key in the DB credentials secret holding this role's password.
+    passwordKey: "app-password"
+
+  # -- Used to build the DATABASE_URL for all services when postgresql.enabled=true
+  # Override this if connecting to an external database
+  external:
+    host: ""
+    port: 5432

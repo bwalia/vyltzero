@@ -1,0 +1,20 @@
+[package]
+name = "vyltzero-storage"
+version = "0.1.0"
+edition = "2021"
+description = "PostgreSQL storage layer with typed query wrappers"
+license = "Apache-2.0"
+
+[dependencies]
+vyltzero-core = { path = "../vyltzero-core" }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

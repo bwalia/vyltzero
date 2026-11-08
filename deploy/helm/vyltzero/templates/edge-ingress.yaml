@@ -1,0 +1,163 @@
+{{/*
+Edge Ingress for the vyltzero control plane (Traefik / k3s).
+
+This is the chart-managed equivalent of deploy/k8s/vyltzero-ingress.yaml — keep
+the two in sync. It is DISABLED by default (edgeIngress.enabled=false) so that
+operators who apply the raw manifest out-of-band do not end up with two Ingress
+objects named the same. Enable exactly one of the two mechanisms.
+
+The path map lives in values (edgeIngress.routes) and is verified against the
+actual axum route registrations under services/ — axum matches routes exactly,
+so only prefixes a backend really serves are listed. Backends whose APIs are
+gRPC-only (audit-service) or unimplemented over HTTP
+(/v1/identity) are deliberately absent. /v1/leases is HTTP on lease-manager.
+*/}}
+{{- if .Values.edgeIngress.enabled }}
+{{- $ctx := . }}
+{{- $ei := .Values.edgeIngress }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "vyltzero.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: {{ $ei.entrypoint | default "websecure" }}
+spec:
+  ingressClassName: {{ $ei.ingressClassName | default "traefik" }}
+  tls:
+    - secretName: {{ $ei.tls.secretName }}
+      hosts:
+        {{- range $ei.tls.hosts }}
+        - {{ . | quote }}
+        {{- end }}
+  rules:
+    {{/*
+    One rule per host, all serving the same route map. A region needs more
+    than one name: its own per-region host (vault-a…, so peers and operators
+    can address THIS region specifically) and the shared alias
+    (vault.workstation.co.uk) that the PoP points at whichever region is
+    currently taking default traffic. Both regions answering the alias is what
+    makes failover a PoP-side change rather than a chart change.
+    */}}
+    {{- range concat (list $ei.host) ($ei.extraHosts | default list) }}
+    - host: {{ . | quote }}
+      http:
+        paths:
+          {{- range $ei.routes }}
+          - path: {{ .path | quote }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "vyltzero.componentFullname" (dict "component" .component "context" $ctx) }}
+                port:
+                  number: {{ .port }}
+          {{- end }}
+          {{- if and $.Values.replicationAgent.enabled $.Values.replicationAgent.publishPeerEndpoint }}
+          {{/*
+          Peer-facing replication API. Gated behind
+          replicationAgent.publishPeerEndpoint because publishing it against an
+          image that predates the shared-token guard exposes the outbox — with
+          its cleartext policy documents and tenant roster — to the internet.
+          See the value's comment for the check before enabling.
+          */}}
+          - path: /v1/replication
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "vyltzero.componentFullname" (dict "component" "replication-agent" "context" $ctx) }}
+                port:
+                  number: {{ $.Values.replicationAgent.httpPort }}
+          {{/*
+          Peer liveness. region-health polls "<endpoint>/health" for every peer
+          in system.regions (services/region-health/src/poller.rs), and that
+          path is hardcoded — the chart's /healthz route reaches secret-engine
+          and does not answer it. Without this the probe 404s, every peer is
+          marked offline after three failures, and the mesh reports itself down
+          while replicating perfectly well.
+
+          Unauthenticated by design: /health sits outside the shared-token guard
+          in the replication-agent so kubelet probes and peers can reach it. It
+          returns a bare 200 and discloses nothing.
+          */}}
+          - path: /health
+            pathType: Exact
+            backend:
+              service:
+                name: {{ include "vyltzero.componentFullname" (dict "component" "replication-agent" "context" $ctx) }}
+                port:
+                  number: {{ $.Values.replicationAgent.httpPort }}
+          {{- end }}
+    {{- end }}
+{{- if $ei.httpRedirect.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: redirect-https
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "vyltzero.fullname" . }}-http-redirect
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: {{ $ei.httpRedirect.entrypoint | default "web" }}
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-redirect-https@kubernetescrd
+spec:
+  ingressClassName: {{ $ei.ingressClassName | default "traefik" }}
+  rules:
+    {{- range concat (list $ei.host) (without $ei.tls.hosts $ei.host) }}
+    - host: {{ . | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "vyltzero.componentFullname" (dict "component" "secret-engine" "context" $ctx) }}
+                port:
+                  number: 8081
+    {{- end }}
+{{- end }}
+---
+# Allow the Traefik ingress controller (kube-system) to reach vyltzero HTTP
+# ports. The chart's default-deny NetworkPolicy only permits in-namespace and
+# gateway traffic; with the gateway disabled Traefik is the new edge.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" . }}-allow-traefik-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: {{ include "vyltzero.name" . }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        {{- range (list 8081 8082 8083 8084 8085 8086 8087 8088 8091 8092) }}
+        - port: {{ . }}
+          protocol: TCP
+        {{- end }}
+{{- end }}

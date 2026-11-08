@@ -1,0 +1,1165 @@
+//! HTTP handlers for tenant CRUD operations.
+//!
+//! Exposes four REST endpoints under `/v1/tenants`:
+//!
+//! | Method   | Path                | Description         |
+//! |----------|---------------------|---------------------|
+//! | POST     | /v1/tenants         | Create a new tenant |
+//! | GET      | /v1/tenants         | List all tenants    |
+//! | GET      | /v1/tenants/:id     | Get a single tenant |
+//! | DELETE   | /v1/tenants/:id     | Soft-delete tenant  |
+//!
+//! When the `DATABASE_URL` environment variable is set at startup the
+//! handlers delegate to `vyltzero_storage::tenant_store` for persistence.
+//! Otherwise they fall back to an in-memory store so the service can be
+//! developed and tested without a live database.
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
+
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use tracing::{error, info};
+use uuid::Uuid;
+use vyltzero_core::{
+    types::secret::SecretEnvironment,
+    types::tenant::{Tenant, TenantId, TenantKind, TenantTier},
+    VaultError,
+};
+use vyltzero_storage::pool::DbPool;
+
+// ---------------------------------------------------------------------------
+// Shared application state
+// ---------------------------------------------------------------------------
+
+/// Selects between the PostgreSQL-backed store and the in-memory fallback.
+///
+/// Constructed once at startup and cloned cheaply into each request handler
+/// via axum's `State` extractor.
+#[derive(Clone)]
+pub struct TenantStoreState {
+    inner: TenantStoreInner,
+}
+
+/// Policy every new tenant starts with, granting its own members full control
+/// of its own secrets — and nothing else.
+///
+/// Without it a tenant is born unusable. Keys issued by invitation carry
+/// `["default"]`, and a policy name that resolves to nothing grants nothing:
+/// the holder signs in successfully and is then refused on every request,
+/// including listing their own secrets. That is what shipped first, and it
+/// looked like a permissions bug rather than a missing row.
+///
+/// Scoped to the tenant's own secrets and its own transit keys. It does not
+/// grant policy management or anything cross-tenant — those are separate
+/// decisions an operator makes deliberately, not defaults a tenant inherits by
+/// existing. Transit is in because the console shows it to every member, not
+/// only administrators; without the grant the page is advertised and then
+/// refuses every request.
+const DEFAULT_TENANT_POLICY: &str = "default";
+
+/// Create the tenant's baseline policy.
+///
+/// Failure is logged, not propagated: the tenant row is already committed by
+/// the time this runs, and failing the request would report "tenant not
+/// created" for a tenant that exists — sending an operator to create it twice.
+/// The tenant is recoverable (the policy can be written by hand); a phantom
+/// duplicate is messier.
+async fn seed_default_policy(pool: &vyltzero_storage::pool::DbPool, tenant_id: &Uuid) {
+    let document = serde_json::json!({
+        "name": DEFAULT_TENANT_POLICY,
+        "rules": [
+            {
+                // `secret/**` covers both shapes the engine checks:
+                // `secret/list` and `secret/data/<path>`.
+                "paths": ["secret/**"],
+                "capabilities": ["read", "write", "list", "delete"],
+            },
+            {
+                // transit-engine scopes every store call to the tenant from the
+                // verified token, so these paths can only name the tenant's own
+                // keys. Covers `transit/keys`, `transit/keys/<name>` and the
+                // encrypt / decrypt / sign / verify / rewrap forms.
+                "paths": ["transit/**"],
+                "capabilities": ["read", "write", "list"],
+            },
+        ],
+    });
+
+    match vyltzero_storage::policy_store::put_policy(
+        pool,
+        tenant_id,
+        DEFAULT_TENANT_POLICY,
+        &document,
+    )
+    .await
+    {
+        Ok(_) => info!(tenant_id = %tenant_id, "seeded the tenant's default policy"),
+        Err(e) => error!(
+            error = %e,
+            tenant_id = %tenant_id,
+            "could not seed the default policy — members of this tenant will be \
+             refused on every request until one is created"
+        ),
+    }
+}
+
+#[derive(Clone)]
+enum TenantStoreInner {
+    /// Live PostgreSQL pool (present when DATABASE_URL is configured).
+    Database(DbPool),
+    /// In-memory fallback keyed by tenant UUID.
+    Memory(Arc<RwLock<HashMap<Uuid, Tenant>>>),
+}
+
+impl TenantStoreState {
+    /// Constructs state from the environment.
+    ///
+    /// Returns a `Database` variant backed by a live PostgreSQL pool when
+    /// `DATABASE_URL` is set; otherwise falls back to an empty in-memory store
+    /// and logs a warning. Fails only if `DATABASE_URL` is set but the pool
+    /// cannot be established.
+    pub async fn from_env() -> Result<Self, VaultError> {
+        match std::env::var("DATABASE_URL") {
+            Ok(url) if !url.is_empty() => {
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(5)
+                    .connect(&url)
+                    .await
+                    .map_err(|e| VaultError::Database {
+                        reason: format!("tenant store pool: {e}"),
+                    })?;
+                tracing::info!("tenant store: using PostgreSQL backend");
+                Ok(Self {
+                    inner: TenantStoreInner::Database(DbPool::from_pool(pool)),
+                })
+            }
+            _ => {
+                tracing::warn!(
+                    "DATABASE_URL not set; tenant store using in-memory fallback (data is not persisted)"
+                );
+                Ok(Self {
+                    inner: TenantStoreInner::Memory(Arc::new(RwLock::new(HashMap::new()))),
+                })
+            }
+        }
+    }
+
+    /// Insert a tenant into whichever backend is active.
+    async fn create(&self, tenant: Tenant) -> Result<(), VaultError> {
+        match &self.inner {
+            TenantStoreInner::Database(pool) => {
+                vyltzero_storage::tenant_store::create_tenant(pool, &tenant).await?;
+                seed_default_policy(pool, tenant.id.as_uuid()).await;
+                Ok(())
+            }
+            TenantStoreInner::Memory(map) => {
+                let mut guard = map.write().map_err(|e| VaultError::Internal {
+                    reason: format!("in-memory store lock poisoned: {e}"),
+                })?;
+                let uuid = *tenant.id.as_uuid();
+                if guard.contains_key(&uuid) {
+                    return Err(VaultError::ValidationError {
+                        field: "id".into(),
+                        reason: format!("tenant '{}' already exists", uuid),
+                    });
+                }
+                guard.insert(uuid, tenant);
+                Ok(())
+            }
+        }
+    }
+
+    /// Retrieve one tenant by ID.
+    async fn get(&self, tenant_id: &TenantId) -> Result<Tenant, VaultError> {
+        match &self.inner {
+            TenantStoreInner::Database(pool) => {
+                vyltzero_storage::tenant_store::get_tenant(pool, tenant_id).await
+            }
+            TenantStoreInner::Memory(map) => {
+                let guard = map.read().map_err(|e| VaultError::Internal {
+                    reason: format!("in-memory store lock poisoned: {e}"),
+                })?;
+                guard
+                    .get(tenant_id.as_uuid())
+                    .cloned()
+                    .ok_or_else(|| VaultError::TenantNotFound {
+                        tenant_id: tenant_id.to_string(),
+                    })
+            }
+        }
+    }
+
+    /// Return all active (non-deleted) tenants.
+    async fn list(&self) -> Result<Vec<Tenant>, VaultError> {
+        match &self.inner {
+            TenantStoreInner::Database(pool) => {
+                vyltzero_storage::tenant_store::list_tenants(pool).await
+            }
+            TenantStoreInner::Memory(map) => {
+                let guard = map.read().map_err(|e| VaultError::Internal {
+                    reason: format!("in-memory store lock poisoned: {e}"),
+                })?;
+                let mut tenants: Vec<Tenant> = guard
+                    .values()
+                    .filter(|t| t.deleted_at.is_none())
+                    .cloned()
+                    .collect();
+                // Return deterministic ordering by slug for testability.
+                tenants.sort_by(|a, b| a.slug.cmp(&b.slug));
+                Ok(tenants)
+            }
+        }
+    }
+
+    /// Soft-delete a tenant by setting `deleted_at`.
+    async fn soft_delete(&self, tenant_id: &TenantId) -> Result<(), VaultError> {
+        match &self.inner {
+            TenantStoreInner::Database(pool) => {
+                vyltzero_storage::tenant_store::soft_delete_tenant(pool, tenant_id).await
+            }
+            TenantStoreInner::Memory(map) => {
+                let mut guard = map.write().map_err(|e| VaultError::Internal {
+                    reason: format!("in-memory store lock poisoned: {e}"),
+                })?;
+                let tenant = guard.get_mut(tenant_id.as_uuid()).ok_or_else(|| {
+                    VaultError::TenantNotFound {
+                        tenant_id: tenant_id.to_string(),
+                    }
+                })?;
+                if tenant.deleted_at.is_some() {
+                    return Err(VaultError::TenantNotFound {
+                        tenant_id: tenant_id.to_string(),
+                    });
+                }
+                tenant.deleted_at = Some(Utc::now());
+                Ok(())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wire types (HTTP request / response bodies)
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /v1/tenants`.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct CreateTenantRequest {
+    /// URL-safe short name, globally unique (e.g. "acme-corp").
+    pub slug: String,
+    /// Human-readable display name shown in the UI.
+    pub display_name: String,
+    /// Isolation tier: "shared" | "dedicated" | "sovereign".
+    pub tier: Option<String>,
+    /// ID of the tenant's root key-encryption key in the crypto-service.
+    pub root_key_id: String,
+    /// `project` (INT/TEST/ACC) or `production` (PROD only). Defaults to project.
+    #[serde(default)]
+    pub tenant_kind: Option<String>,
+    /// Override allowed SDLC environments. Must be a subset of INT/TEST/ACC/PROD.
+    #[serde(default)]
+    pub allowed_environments: Option<Vec<String>>,
+    /// Default environment for new secrets in this tenant.
+    #[serde(default)]
+    pub default_environment: Option<String>,
+    /// Optional tenant-level tags (e.g. project:dta).
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+}
+
+/// Response body returned for single-tenant operations.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct TenantResponse {
+    pub id: String,
+    pub slug: String,
+    pub display_name: String,
+    pub tier: String,
+    pub root_key_id: String,
+    pub tenant_kind: String,
+    pub allowed_environments: Vec<String>,
+    pub default_environment: String,
+    pub tags: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<String>,
+}
+
+impl From<&Tenant> for TenantResponse {
+    fn from(t: &Tenant) -> Self {
+        let tier_str = match t.tier {
+            TenantTier::Shared => "shared",
+            TenantTier::Dedicated => "dedicated",
+            TenantTier::Sovereign => "sovereign",
+        };
+        Self {
+            id: t.id.to_string(),
+            slug: t.slug.clone(),
+            display_name: t.display_name.clone(),
+            tier: tier_str.to_string(),
+            root_key_id: t.root_key_id.clone(),
+            tenant_kind: t.tenant_kind.as_str().to_string(),
+            allowed_environments: t
+                .allowed_environments
+                .iter()
+                .map(|e| e.as_str().to_string())
+                .collect(),
+            default_environment: t.default_environment.as_str().to_string(),
+            tags: t.tags.clone(),
+            created_at: t.created_at.to_rfc3339(),
+            updated_at: t.updated_at.to_rfc3339(),
+            deleted_at: t.deleted_at.map(|dt| dt.to_rfc3339()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Validation helpers
+// ---------------------------------------------------------------------------
+
+/// Returns `Err` if `slug` contains characters outside [a-z0-9-].
+fn validate_slug(slug: &str) -> Result<(), String> {
+    if slug.is_empty() {
+        return Err("slug must not be empty".into());
+    }
+    if !slug
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err("slug must contain only lowercase letters, digits, and hyphens".into());
+    }
+    Ok(())
+}
+
+/// Parse a tier string from the request body, defaulting to `Shared`.
+fn parse_tier(tier_opt: Option<&str>) -> Result<TenantTier, String> {
+    match tier_opt {
+        None | Some("shared") => Ok(TenantTier::Shared),
+        Some("dedicated") => Ok(TenantTier::Dedicated),
+        Some("sovereign") => Ok(TenantTier::Sovereign),
+        Some(other) => Err(format!(
+            "unknown tier '{}'; must be one of: shared, dedicated, sovereign",
+            other
+        )),
+    }
+}
+
+fn resolve_allowed_environments(
+    kind: TenantKind,
+    override_list: Option<&Vec<String>>,
+) -> Result<Vec<SecretEnvironment>, String> {
+    if kind == TenantKind::Production {
+        // Production tenants are always PROD-only — ignore overrides that would
+        // mix lower environments into the production tenancy.
+        return Ok(TenantKind::Production.default_allowed());
+    }
+    match override_list {
+        None => Ok(kind.default_allowed()),
+        Some(list) if list.is_empty() => Ok(kind.default_allowed()),
+        Some(list) => {
+            let mut out = Vec::new();
+            for s in list {
+                let env: SecretEnvironment = s.parse()?;
+                if env == SecretEnvironment::Prod {
+                    return Err(
+                        "project tenants cannot allow PROD — create a separate production tenant"
+                            .into(),
+                    );
+                }
+                if !out.contains(&env) {
+                    out.push(env);
+                }
+            }
+            if out.is_empty() {
+                return Err("allowed_environments must not be empty".into());
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn resolve_default_environment(
+    kind: TenantKind,
+    allowed: &[SecretEnvironment],
+    override_default: Option<&str>,
+) -> Result<SecretEnvironment, String> {
+    let env = match override_default {
+        None | Some("") => kind.default_environment(),
+        Some(s) => s.parse()?,
+    };
+    if !allowed.contains(&env) {
+        return Err(format!(
+            "default_environment {} is not in allowed_environments",
+            env.as_str()
+        ));
+    }
+    Ok(env)
+}
+
+/// Map a `VaultError` to an appropriate HTTP status code.
+fn vault_error_status(err: &VaultError) -> StatusCode {
+    match err {
+        VaultError::TenantNotFound { .. } => StatusCode::NOT_FOUND,
+        VaultError::ValidationError { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+/// POST /v1/tenants — create a new tenant.
+///
+/// The generated `TenantId` uses UUIDv7 so it embeds a monotonic timestamp,
+/// enabling time-ordered range scans without a separate `created_at` index.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants",
+    request_body = CreateTenantRequest,
+    responses(
+        (status = 201, description = "Tenant created", body = TenantResponse),
+        (status = 422, description = "Invalid slug, display_name, root_key_id, or tier"),
+        (status = 500, description = "Internal error (e.g. duplicate ID in store)"),
+    ),
+    tag = "tenants"
+)]
+pub async fn create_tenant(
+    State(store): State<TenantStoreState>,
+    Json(payload): Json<CreateTenantRequest>,
+) -> impl IntoResponse {
+    if let Err(msg) = validate_slug(&payload.slug) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "code": "invalid_slug",
+                "message": msg,
+            })),
+        )
+            .into_response();
+    }
+
+    if payload.display_name.trim().is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "code": "invalid_display_name",
+                "message": "display_name must not be blank",
+            })),
+        )
+            .into_response();
+    }
+
+    if payload.root_key_id.trim().is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "code": "invalid_root_key_id",
+                "message": "root_key_id must not be blank",
+            })),
+        )
+            .into_response();
+    }
+
+    let tier = match parse_tier(payload.tier.as_deref()) {
+        Ok(t) => t,
+        Err(msg) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "code": "invalid_tier",
+                    "message": msg,
+                })),
+            )
+                .into_response()
+        }
+    };
+
+    let tenant_kind = match payload
+        .tenant_kind
+        .as_deref()
+        .unwrap_or("project")
+        .parse::<TenantKind>()
+    {
+        Ok(k) => k,
+        Err(msg) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "code": "invalid_tenant_kind",
+                    "message": msg,
+                })),
+            )
+                .into_response()
+        }
+    };
+
+    let allowed_environments =
+        match resolve_allowed_environments(tenant_kind, payload.allowed_environments.as_ref()) {
+            Ok(v) => v,
+            Err(msg) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "code": "invalid_allowed_environments",
+                        "message": msg,
+                    })),
+                )
+                    .into_response()
+            }
+        };
+
+    let default_environment = match resolve_default_environment(
+        tenant_kind,
+        &allowed_environments,
+        payload.default_environment.as_deref(),
+    ) {
+        Ok(v) => v,
+        Err(msg) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "code": "invalid_default_environment",
+                    "message": msg,
+                })),
+            )
+                .into_response()
+        }
+    };
+
+    let tags = payload
+        .tags
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>();
+
+    let now = Utc::now();
+    let tenant = Tenant {
+        id: TenantId::new(),
+        slug: payload.slug,
+        display_name: payload.display_name,
+        tier,
+        root_key_id: payload.root_key_id,
+        tenant_kind,
+        allowed_environments,
+        default_environment,
+        tags,
+        created_at: now,
+        updated_at: now,
+        deleted_at: None,
+    };
+
+    match store.create(tenant.clone()).await {
+        Ok(()) => {
+            tracing::info!(
+                tenant_id = %tenant.id,
+                slug = %tenant.slug,
+                "tenant created"
+            );
+            (StatusCode::CREATED, Json(TenantResponse::from(&tenant))).into_response()
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to create tenant");
+            (
+                vault_error_status(&err),
+                Json(serde_json::json!({
+                    "code": "create_failed",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// GET /v1/tenants — list all active tenants.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants",
+    responses(
+        (status = 200, description = "List of active (non-deleted) tenants", body = Vec<TenantResponse>),
+        (status = 500, description = "Internal store error"),
+    ),
+    tag = "tenants"
+)]
+pub async fn list_tenants(State(store): State<TenantStoreState>) -> impl IntoResponse {
+    match store.list().await {
+        Ok(tenants) => {
+            let body: Vec<TenantResponse> = tenants.iter().map(TenantResponse::from).collect();
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "failed to list tenants");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "code": "list_failed",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// GET /v1/tenants/:id — get a single tenant by UUID.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{id}",
+    params(
+        ("id" = String, Path, description = "Tenant UUID"),
+    ),
+    responses(
+        (status = 200, description = "Tenant found", body = TenantResponse),
+        (status = 400, description = "Invalid UUID format"),
+        (status = 404, description = "Tenant not found"),
+        (status = 500, description = "Internal store error"),
+    ),
+    tag = "tenants"
+)]
+pub async fn get_tenant(
+    State(state): State<TenantReadState>,
+    headers: axum::http::HeaderMap,
+    Path(id_str): Path<String>,
+) -> impl IntoResponse {
+    let store = &state.store;
+    let tenant_id: TenantId = match id_str.parse() {
+        Ok(t) => t,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "invalid_id",
+                    "message": "tenant id must be a valid UUID",
+                })),
+            )
+                .into_response()
+        }
+    };
+
+    // Authorised here rather than by a blanket router-level admin gate.
+    //
+    // Reading the tenant you belong to is not a platform operation. Behind
+    // `require_admin` the console's own header — which looks up the signed-in
+    // tenant's display name to show it — answered 403 to every ordinary
+    // member, so the app greeted its users by refusing them. Listing tenants
+    // still requires an administrator, because that one *is* cross-tenant.
+    //
+    // Administrators are asked first, and through the same gate as every other
+    // management route, so the bootstrap `X-Admin-Token` keeps working here. It
+    // authenticates no ordinary member, which is what the second arm is for.
+    if state.admin.authenticate(&headers).await.is_err() {
+        match vyltzero_core::auth::resolve_identity(&headers).await {
+            Ok(identity) if identity.tenant_id == id_str => {}
+            Ok(identity) => {
+                tracing::warn!(
+                    principal_id = %identity.principal_id,
+                    home_tenant = %identity.tenant_id,
+                    asked_for = %id_str,
+                    "refused a cross-tenant tenant read"
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "code": "cross_tenant_denied",
+                        "message": "you can read your own tenant; reading another requires \
+                                    platform administration",
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "code": "unauthenticated",
+                        "message": e.to_string(),
+                    })),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    match store.get(&tenant_id).await {
+        Ok(tenant) => (StatusCode::OK, Json(TenantResponse::from(&tenant))).into_response(),
+        Err(VaultError::TenantNotFound { .. }) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "code": "not_found",
+                "message": format!("tenant '{}' not found", id_str),
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, tenant_id = %id_str, "failed to get tenant");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "code": "get_failed",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// DELETE /v1/tenants/:id — soft-delete a tenant.
+///
+/// Uses a soft-delete pattern: sets `deleted_at` on the record rather than
+/// removing the row.  This preserves audit history and allows recovery in
+/// case of accidental deletion.  A hard-delete path can be added later.
+#[utoipa::path(
+    delete,
+    path = "/v1/tenants/{id}",
+    params(
+        ("id" = String, Path, description = "Tenant UUID to soft-delete"),
+    ),
+    responses(
+        (status = 204, description = "Tenant soft-deleted"),
+        (status = 400, description = "Invalid UUID format"),
+        (status = 404, description = "Tenant not found or already deleted"),
+        (status = 500, description = "Internal store error"),
+    ),
+    tag = "tenants"
+)]
+pub async fn delete_tenant(
+    State(store): State<TenantStoreState>,
+    Path(id_str): Path<String>,
+) -> impl IntoResponse {
+    let tenant_id: TenantId = match id_str.parse() {
+        Ok(t) => t,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "invalid_id",
+                    "message": "tenant id must be a valid UUID",
+                })),
+            )
+                .into_response()
+        }
+    };
+
+    match store.soft_delete(&tenant_id).await {
+        Ok(()) => {
+            tracing::info!(tenant_id = %id_str, "tenant soft-deleted");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(VaultError::TenantNotFound { .. }) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "code": "not_found",
+                "message": format!("tenant '{}' not found", id_str),
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, tenant_id = %id_str, "failed to delete tenant");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "code": "delete_failed",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+/// Builds an `axum::Router` containing the tenant CRUD routes.
+///
+/// Mount at application startup alongside the health router:
+/// ```no_run
+/// let app = health::router().merge(tenant_handlers::router(store));
+/// ```
+/// Tenant CRUD, behind the administrator gate.
+///
+/// These routes had no guard at all. `GET /v1/tenants` returned every tenant in
+/// the deployment — id, slug, display name, tier and `root_key_id` — to anyone
+/// who could reach the port, and `POST` created one, and `DELETE` removed one.
+/// The vault-ui pod proxies `/api/identity/*`, so all three were reachable from
+/// wherever the UI is published.
+///
+/// Managing tenants is a platform operation, not a tenant one: listing them is
+/// inherently cross-tenant, and creating one is how the platform grows. So they
+/// require an administrator — the `VAULT_ADMIN_TOKEN` bootstrap credential, a
+/// token carrying the administrator policy, or a superuser token.
+///
+/// `GET /v1/tenants/:id` is the exception and is mounted separately. Reading
+/// the tenant you belong to is an ordinary member's business — the console
+/// header does it on every page to show the tenant's name — so that one
+/// authorises inside the handler, which can tell "my own tenant" from
+/// "somebody else's". Under the blanket gate it could not, and answered 403 to
+/// every non-administrator.
+pub fn router(store: TenantStoreState, admin_auth: crate::api_keys::AdminAuth) -> Router {
+    let platform_routes = Router::new()
+        .route("/v1/tenants", post(create_tenant).get(list_tenants))
+        .route("/v1/tenants/:id", axum::routing::delete(delete_tenant))
+        .with_state(store.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            admin_auth.clone(),
+            crate::api_keys::require_admin,
+        ));
+
+    Router::new()
+        .route("/v1/tenants/:id", get(get_tenant))
+        .with_state(TenantReadState {
+            store,
+            admin: admin_auth,
+        })
+        .merge(platform_routes)
+}
+
+/// What `get_tenant` needs: the store, plus the same admin gate the platform
+/// routes use.
+///
+/// It carries the gate rather than sitting behind it because it has to
+/// distinguish "an administrator, reading anything" from "a member, reading
+/// their own" — a decision that needs the path parameter, which a router-level
+/// layer does not have.
+#[derive(Clone)]
+pub struct TenantReadState {
+    store: TenantStoreState,
+    admin: crate::api_keys::AdminAuth,
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt; // for `oneshot`
+
+    /// Admin gate with a known bootstrap token, so the tests exercise the
+    /// guard rather than bypassing it.
+    fn test_admin() -> crate::api_keys::AdminAuth {
+        crate::api_keys::AdminAuth::new(
+            crate::token::TokenManager::new(b"test-secret-that-is-at-least-32-bytes!!"),
+            Some(b"test-admin-token".to_vec()),
+            "admin",
+        )
+    }
+
+    /// An HS256 token for an ordinary member of `tenant_id`, signed with the
+    /// same secret `test_admin` verifies against. No administrator policy — the
+    /// whole point is that it is the credential the gate used to reject.
+    fn member_token(tenant_id: &str) -> String {
+        // `resolve_identity` reads the shared secret from the process
+        // environment. Every caller here sets the same value, so the tests do
+        // not race each other over it.
+        std::env::set_var(
+            "VAULT_JWT_SECRET",
+            "test-secret-that-is-at-least-32-bytes!!",
+        );
+        crate::token::TokenManager::new(b"test-secret-that-is-at-least-32-bytes!!")
+            .issue_token(
+                "member-principal",
+                tenant_id,
+                vec!["default".to_string()],
+                300,
+            )
+            .expect("issuing a test token")
+            .0
+    }
+
+    fn memory_store() -> TenantStoreState {
+        TenantStoreState {
+            inner: TenantStoreInner::Memory(Arc::new(RwLock::new(HashMap::new()))),
+        }
+    }
+
+    fn sample_tenant(slug: &str) -> Tenant {
+        let now = Utc::now();
+        let kind = TenantKind::Project;
+        Tenant {
+            id: TenantId::new(),
+            slug: slug.to_string(),
+            display_name: format!("{slug} Corp"),
+            tier: TenantTier::Shared,
+            root_key_id: "kek-001".to_string(),
+            tenant_kind: kind,
+            allowed_environments: kind.default_allowed(),
+            default_environment: kind.default_environment(),
+            tags: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        }
+    }
+
+    #[test]
+    fn validate_slug_accepts_valid_slugs() {
+        assert!(validate_slug("acme-corp").is_ok());
+        assert!(validate_slug("tenant123").is_ok());
+        assert!(validate_slug("a").is_ok());
+    }
+
+    #[test]
+    fn validate_slug_rejects_invalid_slugs() {
+        assert!(validate_slug("").is_err());
+        assert!(validate_slug("Uppercase").is_err());
+        assert!(validate_slug("spaces not allowed").is_err());
+        assert!(validate_slug("underscore_not_allowed").is_err());
+    }
+
+    #[test]
+    fn parse_tier_defaults_to_shared() {
+        assert!(matches!(parse_tier(None), Ok(TenantTier::Shared)));
+        assert!(matches!(parse_tier(Some("shared")), Ok(TenantTier::Shared)));
+    }
+
+    #[test]
+    fn parse_tier_rejects_unknown() {
+        assert!(parse_tier(Some("premium")).is_err());
+    }
+
+    #[tokio::test]
+    async fn memory_store_create_and_get() {
+        let store = memory_store();
+        let tenant = sample_tenant("acme");
+        let tenant_id = tenant.id.clone();
+        store.create(tenant).await.unwrap();
+        let fetched = store.get(&tenant_id).await.unwrap();
+        assert_eq!(fetched.slug, "acme");
+    }
+
+    #[tokio::test]
+    async fn memory_store_list_excludes_deleted() {
+        let store = memory_store();
+        let t1 = sample_tenant("alpha");
+        let t2 = sample_tenant("beta");
+        let t2_id = t2.id.clone();
+        store.create(t1).await.unwrap();
+        store.create(t2).await.unwrap();
+        store.soft_delete(&t2_id).await.unwrap();
+        let active = store.list().await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].slug, "alpha");
+    }
+
+    #[tokio::test]
+    async fn memory_store_soft_delete_idempotency() {
+        let store = memory_store();
+        let tenant = sample_tenant("gamma");
+        let id = tenant.id.clone();
+        store.create(tenant).await.unwrap();
+        store.soft_delete(&id).await.unwrap();
+        // Second delete should return TenantNotFound because the tenant is
+        // already marked deleted.
+        let result = store.soft_delete(&id).await;
+        assert!(matches!(result, Err(VaultError::TenantNotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn http_create_tenant_returns_201() {
+        let app = router(memory_store(), test_admin());
+        let body = serde_json::json!({
+            "slug": "test-tenant",
+            "display_name": "Test Tenant",
+            "tier": "shared",
+            "root_key_id": "kek-test"
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/tenants")
+            .header("content-type", "application/json")
+            .header("X-Admin-Token", "test-admin-token")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn http_create_tenant_invalid_slug_returns_422() {
+        let app = router(memory_store(), test_admin());
+        let body = serde_json::json!({
+            "slug": "INVALID SLUG",
+            "display_name": "Bad",
+            "root_key_id": "kek-test"
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/tenants")
+            .header("content-type", "application/json")
+            .header("X-Admin-Token", "test-admin-token")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// A member may read the tenant it belongs to.
+    ///
+    /// This is what the console header does on every page load. Behind the
+    /// blanket admin gate it answered 403 to everyone without the platform
+    /// policy, so signing in as an ordinary member threw an error dialog
+    /// reading "does not carry the administrator policy" before the dashboard
+    /// had rendered anything.
+    #[tokio::test]
+    async fn a_member_may_read_its_own_tenant() {
+        let store = memory_store();
+        let tenant = sample_tenant("acme");
+        let id = tenant.id.clone();
+        store.create(tenant).await.unwrap();
+
+        let app = router(store, test_admin());
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/tenants/{id}"))
+            .header(
+                "authorization",
+                format!("Bearer {}", member_token(&id.to_string())),
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    /// ...and only that one. The relaxation is "your own tenant", not "any
+    /// tenant" — the id in the path is attacker-controlled and the only thing
+    /// standing between a member and another organisation's record.
+    #[tokio::test]
+    async fn a_member_may_not_read_another_tenant() {
+        let store = memory_store();
+        let theirs = sample_tenant("acme");
+        let theirs_id = theirs.id.clone();
+        store.create(theirs).await.unwrap();
+
+        let app = router(store, test_admin());
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/tenants/{theirs_id}"))
+            .header(
+                "authorization",
+                format!("Bearer {}", member_token(&TenantId::new().to_string())),
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// Listing is inherently cross-tenant and stays an administrator's job.
+    #[tokio::test]
+    async fn a_member_may_not_list_tenants() {
+        let app = router(memory_store(), test_admin());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/tenants")
+            .header(
+                "authorization",
+                format!("Bearer {}", member_token(&TenantId::new().to_string())),
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn http_get_nonexistent_tenant_returns_404() {
+        let app = router(memory_store(), test_admin());
+        let fake_id = Uuid::now_v7();
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/tenants/{fake_id}"))
+            .header("X-Admin-Token", "test-admin-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn http_delete_tenant_returns_204() {
+        let store = memory_store();
+        let tenant = sample_tenant("to-delete");
+        let tenant_id = tenant.id.clone();
+        store.create(tenant).await.unwrap();
+
+        let app = router(store, test_admin());
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/tenants/{tenant_id}"))
+            .header("X-Admin-Token", "test-admin-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// The routes had no guard at all: `GET /v1/tenants` returned every tenant
+    /// in the deployment — including each one's `root_key_id` — to anyone who
+    /// could reach the port, and POST/DELETE were equally open. The vault-ui
+    /// pod proxies `/api/identity/*`, so all of it was reachable from wherever
+    /// the UI is published.
+    #[tokio::test]
+    async fn tenant_routes_require_an_administrator() {
+        for (method, uri) in [
+            ("GET", "/v1/tenants"),
+            ("POST", "/v1/tenants"),
+            ("GET", "/v1/tenants/00000000-0000-0000-0000-000000000000"),
+            ("DELETE", "/v1/tenants/00000000-0000-0000-0000-000000000000"),
+        ] {
+            let app = router(memory_store(), test_admin());
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must not be reachable without an administrator credential"
+            );
+        }
+    }
+
+    /// A wrong bootstrap token is no better than none.
+    #[tokio::test]
+    async fn a_wrong_admin_token_is_rejected() {
+        let app = router(memory_store(), test_admin());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/tenants")
+            .header("X-Admin-Token", "not-the-right-token")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+}

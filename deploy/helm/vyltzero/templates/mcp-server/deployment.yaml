@@ -1,0 +1,108 @@
+{{/*
+mcp-server/deployment.yaml
+The mcp-server implements the Model Context Protocol (MCP) to expose vyltzero
+secret retrieval capabilities to LLM toolchains. It runs as a single replica
+because MCP sessions are stateful; scale carefully if session affinity is
+handled upstream.
+*/}}
+{{- if .Values.mcpServer.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vyltzero.componentFullname" (dict "component" "mcp-server" "context" $) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.componentLabels" (dict "component" "mcp-server" "componentType" "integration" "context" $) | nindent 4 }}
+  {{- with .Values.mcpServer.podAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.mcpServer.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "vyltzero.componentSelectorLabels" (dict "component" "mcp-server" "context" $) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "vyltzero.componentLabels" (dict "component" "mcp-server" "componentType" "integration" "context" $) | nindent 8 }}
+      {{- if .Values.monitoring.enabled }}
+      annotations:
+        {{- toYaml .Values.monitoring.scrapeAnnotations | nindent 8 }}
+        prometheus.io/port: {{ .Values.mcpServer.httpPort | quote }}
+        {{- with .Values.mcpServer.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- else }}
+      {{- with .Values.mcpServer.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- end }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "vyltzero.serviceAccountName" . }}
+      {{- include "vyltzero.podSecurityContext" . | nindent 6 }}
+      containers:
+        - name: mcp-server
+          image: {{ include "vyltzero.image" (dict "image" .Values.mcpServer.image "context" $) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          {{- include "vyltzero.containerSecurityContext" . | nindent 10 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.mcpServer.httpPort }}
+              protocol: TCP
+          env:
+            - name: HTTP_PORT
+              value: {{ .Values.mcpServer.httpPort | quote }}
+            # HTTP endpoints the mcp-server calls. The binary reads the
+            # VAULT_*_ADDR names below (services/mcp-server/src/main.rs) as full
+            # http:// URLs on the services' HTTP ports — not gRPC. The prior
+            # unprefixed *_ADDR names (and IDENTITY_SERVICE_ADDR, which the binary
+            # never reads) were ignored, so it fell back to unresolvable defaults.
+            - name: VAULT_SECRET_ENGINE_ADDR
+              value: {{ printf "http://%s:%s"
+                          (include "vyltzero.componentFullname" (dict "component" "secret-engine" "context" $))
+                          (.Values.secretEngine.httpPort | toString) }}
+            - name: VAULT_TRANSIT_ENGINE_ADDR
+              value: {{ printf "http://%s:%s"
+                          (include "vyltzero.componentFullname" (dict "component" "transit-engine" "context" $))
+                          (.Values.transitEngine.httpPort | toString) }}
+            - name: VAULT_AUDIT_SERVICE_ADDR
+              value: {{ printf "http://%s:%s"
+                          (include "vyltzero.componentFullname" (dict "component" "audit-service" "context" $))
+                          (.Values.auditService.httpPort | toString) }}
+            - name: VAULT_LEASE_MANAGER_ADDR
+              value: {{ printf "http://%s:%s"
+                          (include "vyltzero.componentFullname" (dict "component" "lease-manager" "context" $))
+                          (.Values.leaseManager.httpPort | toString) }}
+            {{- with .Values.mcpServer.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.mcpServer.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- include "vyltzero.podScheduling" (dict "service" .Values.mcpServer "context" $) | nindent 6 }}
+{{- end }}

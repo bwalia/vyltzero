@@ -1,0 +1,21 @@
+//! vyltzero-storage: PostgreSQL persistence layer for the VyltZero platform.
+//!
+//! Provides typed query wrappers over sqlx, centralizing all database access.
+//! Services import this crate instead of using sqlx directly.
+
+pub mod api_key_store;
+pub mod audit_store;
+pub mod invitation_store;
+pub mod key_store;
+pub mod lease_store;
+pub mod mfa_store;
+pub mod policy_store;
+pub mod pool;
+pub mod quota_store;
+pub mod revocation_store;
+pub mod schema_store;
+pub mod seal_store;
+pub mod secret_store;
+pub mod signing_key_store;
+pub mod tenant_scope;
+pub mod tenant_store;

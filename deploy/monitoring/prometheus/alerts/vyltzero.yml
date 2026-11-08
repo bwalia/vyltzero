@@ -1,0 +1,77 @@
+groups:
+  - name: vyltzero_ha
+    rules:
+      - alert: VyltZeroNoLeader
+        expr: sum(vyltzero_ha_is_leader) == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "No HA leader elected"
+          description: "No VyltZero node is reporting as the cluster leader for 30 seconds."
+
+      - alert: VyltZeroHighReplicationLag
+        expr: max(vyltzero_ha_replication_lag_ms) > 5000
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High replication lag detected"
+          description: "Replication lag is {{ $value }}ms, exceeding 5s threshold."
+
+      - alert: VyltZeroFailoverOccurred
+        expr: increase(vyltzero_ha_failover_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Failover event detected"
+          description: "A failover from {{ $labels.from_region }} to {{ $labels.to_region }} was triggered."
+
+      - alert: VyltZeroClusterDegraded
+        expr: sum(vyltzero_ha_cluster_nodes{state=~"suspect|dead"}) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cluster has unhealthy nodes"
+          description: "{{ $value }} nodes are in suspect or dead state."
+
+  - name: vyltzero_latency
+    rules:
+      - alert: VyltZeroHighLatency
+        expr: histogram_quantile(0.99, sum(rate(vyltzero_http_request_duration_seconds_bucket[5m])) by (le, service)) > 1.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High HTTP latency on {{ $labels.service }}"
+          description: "p99 latency is {{ $value }}s for {{ $labels.service }}."
+
+      - alert: VyltZeroHighErrorRate
+        expr: sum(rate(vyltzero_http_requests_total{status=~"5.."}[5m])) / sum(rate(vyltzero_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate detected"
+          description: "More than 5% of requests are returning 5xx errors."
+
+  - name: vyltzero_security
+    rules:
+      - alert: VyltZeroHighDeniedRate
+        expr: sum(rate(vyltzero_audit_events_by_action{outcome="denied"}[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High rate of denied operations"
+          description: "{{ $value }} denied operations per second detected."
+
+      - alert: VyltZeroAuthFailures
+        expr: sum(rate(vyltzero_auth_attempts_total{outcome="failure"}[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High authentication failure rate"
+          description: "{{ $value }} failed auth attempts per second."

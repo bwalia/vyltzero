@@ -1,0 +1,944 @@
+{{/*
+networkpolicies.yaml
+Default-deny NetworkPolicies plus explicit allow rules for the vyltzero
+service mesh.
+
+Traffic topology (allowed ingress paths):
+  gateway           <- external clients (port 443)
+  identity-service  <- gateway (auth), mcp-server (session auth),
+                       secret-engine + policy-engine + lease-manager (JWKS),
+                       lease-manager (RevokeTokenByHash)
+  secret-engine     <- gateway, mcp-server
+  policy-engine     <- secret-engine, transit-engine, gateway, identity-service
+  crypto-service    <- secret-engine, transit-engine, lease-manager,
+                       identity-service (token-signing key wrap)
+  lease-manager     <- identity-service (CreateLease), secret-engine,
+                       gateway / mcp-server / vault-ui (HTTP)
+  audit-service     <- all services (fire-and-forget audit events)
+  transit-engine    <- gateway
+  mcp-server        <- gateway (MCP HTTP sessions)
+  agent-proxy       <- agent sandboxes (agentProxy.agentNamespaceSelector);
+                       egress to secret-engine, identity-service, audit-service
+                       and public 443 only (templates/agent-proxy/networkpolicy.yaml)
+
+All pods in the release are restricted to the release namespace via
+namespaceSelector unless cross-namespace access is explicitly required.
+*/}}
+{{- if .Values.networkPolicies.enabled }}
+
+{{/*
+────────────────────────────────────────────────────────────────────────────
+Default deny: block all ingress and egress for every pod in the namespace.
+Individual policies below punch holes for legitimate traffic.
+────────────────────────────────────────────────────────────────────────────
+*/}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" . }}-default-deny
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+{{/*
+────────────────────────────────────────────────────────────────────────────
+Allow all pods to reach kube-dns (UDP/TCP 53) so service discovery works.
+────────────────────────────────────────────────────────────────────────────
+*/}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" . }}-allow-dns
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+
+{{/*
+────────────────────────────────────────────────────────────────────────────
+gateway: accept external HTTPS traffic and allow egress to internal services
+────────────────────────────────────────────────────────────────────────────
+*/}}
+{{- if .Values.gateway.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" . }}-gateway
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "vyltzero.componentSelectorLabels" (dict "component" "gateway" "context" $) | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Accept inbound HTTPS from anywhere (external clients)
+    - ports:
+        - port: {{ .Values.gateway.httpsPort }}
+          protocol: TCP
+  egress:
+    # Forward to identity-service HTTP for auth
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "identity-service" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.identityService.httpPort }}
+          protocol: TCP
+    # Forward to secret-engine HTTP
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "secret-engine" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.secretEngine.httpPort }}
+          protocol: TCP
+    # Forward to transit-engine HTTP
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "transit-engine" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.transitEngine.httpPort }}
+          protocol: TCP
+    # Forward to policy-engine HTTP for admin policy management API
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "policy-engine" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.policyEngine.httpPort }}
+          protocol: TCP
+    # Forward to lease-manager HTTP for lease renewal
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "lease-manager" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.leaseManager.httpPort }}
+          protocol: TCP
+    # Forward to mcp-server HTTP
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "mcp-server" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.mcpServer.httpPort }}
+          protocol: TCP
+{{- end }}
+
+{{/*
+────────────────────────────────────────────────────────────────────────────
+crypto-service: accept gRPC from secret-engine, transit-engine, lease-manager,
+                and identity-service (wraps per-tenant token-signing keys)
+────────────────────────────────────────────────────────────────────────────
+*/}}
+{{- if .Values.cryptoService.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" . }}-crypto-service
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "vyltzero.componentSelectorLabels" (dict "component" "crypto-service" "context" $) | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "secret-engine" "context" $) | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "transit-engine" "context" $) | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "lease-manager" "context" $) | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "identity-service" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.cryptoService.grpcPort }}
+          protocol: TCP
+  egress:
+    # crypto-service needs to reach PostgreSQL
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - port: 5432
+          protocol: TCP
+{{- end }}
+
+{{/*
+────────────────────────────────────────────────────────────────────────────
+secret-engine: accept gRPC/HTTP from gateway and mcp-server
+────────────────────────────────────────────────────────────────────────────
+*/}}
+{{- if .Values.secretEngine.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" . }}-secret-engine
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "vyltzero.componentSelectorLabels" (dict "component" "secret-engine" "context" $) | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "gateway" "context" $) | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "mcp-server" "context" $) | nindent 14 }}
+        {{- if .Values.agentProxy.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "agent-proxy" "context" $) | nindent 14 }}
+        {{- end }}
+      ports:
+        - port: {{ .Values.secretEngine.httpPort }}
+          protocol: TCP
+        - port: {{ .Values.secretEngine.grpcPort }}
+          protocol: TCP
+  egress:
+    # Calls crypto-service for all encryption operations
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "crypto-service" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.cryptoService.grpcPort }}
+          protocol: TCP
+    # Consults policy-engine for access decisions
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "policy-engine" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.policyEngine.grpcPort }}
+          protocol: TCP
+    # Fetches the Ed25519 JWKS from identity-service to verify tokens
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "identity-service" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.identityService.httpPort }}
+          protocol: TCP
+    # Emits audit events
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "audit-service" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.auditService.grpcPort }}
+          protocol: TCP
+    # Reaches PostgreSQL for secret storage
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - port: 5432
+          protocol: TCP
+{{- end }}
+
+{{/*
+────────────────────────────────────────────────────────────────────────────
+policy-engine: accept gRPC from secret-engine, transit-engine, gateway,
+               identity-service
+────────────────────────────────────────────────────────────────────────────
+*/}}
+{{- if .Values.policyEngine.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" . }}-policy-engine
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "vyltzero.componentSelectorLabels" (dict "component" "policy-engine" "context" $) | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "secret-engine" "context" $) | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "transit-engine" "context" $) | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "gateway" "context" $) | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "identity-service" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.policyEngine.grpcPort }}
+          protocol: TCP
+        - port: {{ .Values.policyEngine.httpPort }}
+          protocol: TCP
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - port: 5432
+          protocol: TCP
+    # Fetches the Ed25519 JWKS from identity-service to verify tokens
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "identity-service" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.identityService.httpPort }}
+          protocol: TCP
+{{- end }}
+
+{{/*
+────────────────────────────────────────────────────────────────────────────
+identity-service: accept HTTP/gRPC from gateway and mcp-server, plus JWKS
+fetches from the token-verifying services
+────────────────────────────────────────────────────────────────────────────
+*/}}
+{{- if .Values.identityService.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" . }}-identity-service
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "vyltzero.componentSelectorLabels" (dict "component" "identity-service" "context" $) | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "gateway" "context" $) | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "mcp-server" "context" $) | nindent 14 }}
+        {{- if .Values.agentProxy.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "agent-proxy" "context" $) | nindent 14 }}
+        {{- end }}
+      ports:
+        - port: {{ .Values.identityService.httpPort }}
+          protocol: TCP
+        - port: {{ .Values.identityService.grpcPort }}
+          protocol: TCP
+    # Token verifiers fetch the Ed25519 JWKS
+    # (/v1/identity/.well-known/jwks.json, see VAULT_JWKS_URL).
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "secret-engine" "context" $) | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "policy-engine" "context" $) | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "lease-manager" "context" $) | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "audit-service" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.identityService.httpPort }}
+          protocol: TCP
+    # lease-manager RevokeTokenByHash
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "lease-manager" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.identityService.grpcPort }}
+          protocol: TCP
+  egress:
+    # Policy checks during token validation
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "policy-engine" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.policyEngine.grpcPort }}
+          protocol: TCP
+    # Wraps per-tenant token-signing keys via crypto-service; without this
+    # lane every login fails with "token issuance failed: crypto-service:
+    # tcp connect error".
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "crypto-service" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.cryptoService.grpcPort }}
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - port: 5432
+          protocol: TCP
+    # Emit audit events for auth decisions
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "audit-service" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.auditService.grpcPort }}
+          protocol: TCP
+    # CreateLease for issued tokens
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "lease-manager" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.leaseManager.grpcPort }}
+          protocol: TCP
+{{- end }}
+
+{{/*
+────────────────────────────────────────────────────────────────────────────
+lease-manager: accept gRPC from identity-service and secret-engine; HTTP from
+gateway, mcp-server, and the public edge
+────────────────────────────────────────────────────────────────────────────
+*/}}
+{{- if .Values.leaseManager.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" . }}-lease-manager
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "vyltzero.componentSelectorLabels" (dict "component" "lease-manager" "context" $) | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "identity-service" "context" $) | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "secret-engine" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.leaseManager.grpcPort }}
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "gateway" "context" $) | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "mcp-server" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.leaseManager.httpPort }}
+          protocol: TCP
+        - port: {{ .Values.leaseManager.grpcPort }}
+          protocol: TCP
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "identity-service" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.identityService.grpcPort }}
+          protocol: TCP
+        - port: {{ .Values.identityService.httpPort }}
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - port: 5432
+          protocol: TCP
+    # Emit audit events for lease lifecycle changes
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "audit-service" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.auditService.grpcPort }}
+          protocol: TCP
+{{- end }}
+
+{{/*
+────────────────────────────────────────────────────────────────────────────
+audit-service: accept gRPC from all services (write-only ingest port)
+────────────────────────────────────────────────────────────────────────────
+*/}}
+{{- if .Values.auditService.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" . }}-audit-service
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "vyltzero.componentSelectorLabels" (dict "component" "audit-service" "context" $) | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # All vyltzero services may emit audit events; match by part-of label
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: {{ include "vyltzero.name" . }}
+      ports:
+        - port: {{ .Values.auditService.grpcPort }}
+          protocol: TCP
+        - port: {{ .Values.auditService.httpPort }}
+          protocol: TCP
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - port: 5432
+          protocol: TCP
+    # Fetches the Ed25519 JWKS from identity-service to verify tokens on the
+    # HTTP events API.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "identity-service" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.identityService.httpPort }}
+          protocol: TCP
+{{- end }}
+
+{{/*
+────────────────────────────────────────────────────────────────────────────
+transit-engine: accept HTTP from gateway; call crypto-service and policy-engine
+────────────────────────────────────────────────────────────────────────────
+*/}}
+{{- if .Values.transitEngine.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" . }}-transit-engine
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "vyltzero.componentSelectorLabels" (dict "component" "transit-engine" "context" $) | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "gateway" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.transitEngine.httpPort }}
+          protocol: TCP
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "crypto-service" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.cryptoService.grpcPort }}
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "policy-engine" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.policyEngine.grpcPort }}
+          protocol: TCP
+    # Emit audit events for encrypt/decrypt operations
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "audit-service" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.auditService.grpcPort }}
+          protocol: TCP
+{{- end }}
+
+{{/*
+────────────────────────────────────────────────────────────────────────────
+mcp-server: accept HTTP from gateway; call secret-engine and identity-service
+────────────────────────────────────────────────────────────────────────────
+*/}}
+{{- if .Values.mcpServer.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" . }}-mcp-server
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "vyltzero.componentSelectorLabels" (dict "component" "mcp-server" "context" $) | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "gateway" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.mcpServer.httpPort }}
+          protocol: TCP
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "secret-engine" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.secretEngine.grpcPort }}
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "identity-service" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.identityService.grpcPort }}
+          protocol: TCP
+        - port: {{ .Values.identityService.httpPort }}
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vyltzero.componentSelectorLabels" (dict "component" "lease-manager" "context" $) | nindent 14 }}
+      ports:
+        - port: {{ .Values.leaseManager.httpPort }}
+          protocol: TCP
+{{- end }}
+
+{{/*
+────────────────────────────────────────────────────────────────────────────
+pki-engine, region-health, replication-agent, sync-scheduler:
+accept HTTP from vyltzero services and allow egress to PostgreSQL.
+────────────────────────────────────────────────────────────────────────────
+*/}}
+{{- range $svc := tuple
+      (dict "comp" "pki-engine"        "enabled" $.Values.pkiEngine.enabled       "port" $.Values.pkiEngine.httpPort)
+      (dict "comp" "region-health"     "enabled" $.Values.regionHealth.enabled     "port" $.Values.regionHealth.httpPort)
+      (dict "comp" "replication-agent" "enabled" $.Values.replicationAgent.enabled  "port" $.Values.replicationAgent.httpPort)
+      (dict "comp" "sync-scheduler"    "enabled" $.Values.syncScheduler.enabled     "port" $.Values.syncScheduler.httpPort) }}
+{{- if $svc.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" $ }}-{{ $svc.comp }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "vyltzero.componentSelectorLabels" (dict "component" $svc.comp "context" $) | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Peer vyltzero services (and cross-region peers) may reach the HTTP/health port
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: {{ include "vyltzero.name" $ }}
+      ports:
+        - port: {{ $svc.port }}
+          protocol: TCP
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - port: 5432
+          protocol: TCP
+{{- end }}
+{{- end }}
+
+{{/*
+────────────────────────────────────────────────────────────────────────────
+PostgreSQL: accept connections from all vyltzero services
+────────────────────────────────────────────────────────────────────────────
+*/}}
+{{- if .Values.postgresql.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" . }}-postgresql
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgresql
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow all vyltzero microservice pods to reach PostgreSQL
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: {{ include "vyltzero.name" . }}
+      ports:
+        - port: 5432
+          protocol: TCP
+{{- end }}
+
+{{/*
+────────────────────────────────────────────────────────────────────────────
+Edge host ingress: allow host-network wslproxy / traefik-edge instances on
+cluster nodes (the public PoP's origin hop) to reach the public API service
+ports directly via pod IPs. Sources are the flannel host addresses of each
+edge node as a /31 (covers both the flannel.1 .0 and cni0 .1 source IPs) —
+same convention as ui.wslproxyIngress. Empty cidrs renders no policy and the
+default-deny keeps host traffic blocked.
+────────────────────────────────────────────────────────────────────────────
+*/}}
+{{- with .Values.networkPolicies.wslproxyHostIngress }}
+{{- if .cidrs }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" $ }}-allow-wslproxy-hosts
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: {{ include "vyltzero.name" $ }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        {{- range .cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        {{- range .ports }}
+        - port: {{ . }}
+          protocol: TCP
+        {{- end }}
+{{- end }}
+{{- end }}
+
+
+{{/*
+────────────────────────────────────────────────────────────────────────────
+Cross-region replication egress.
+
+The replication-agent polls each peer region's /v1/replication/events over the
+peer's PUBLIC edge URL, and region-health probes each peer's /health the same
+way. There is no pod-network path between edge PoPs — those nodes are labelled
+network.k3s1/cross-node=unavailable — so this traffic leaves the cluster and
+comes back in through the peer's ingress.
+
+The per-service policy above allows egress to PostgreSQL only, so without this
+rule the default-deny silently blackholes every peer poll and the mesh looks
+healthy while replicating nothing.
+
+Egress is restricted to the replication ports on non-private destinations:
+the RFC1918 and link-local ranges are excluded so a compromised agent cannot
+use this hole to sweep the LAN behind the cluster.
+────────────────────────────────────────────────────────────────────────────
+*/}}
+{{- if .Values.global.region.peers }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" . }}-cross-region-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - replication-agent
+          - region-health
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        {{- range .Values.networkPolicies.crossRegionEgressPorts }}
+        - port: {{ . }}
+          protocol: TCP
+        {{- end }}
+{{- end }}
+
+
+{{/*
+────────────────────────────────────────────────────────────────────────────
+identity-service: egress to the external SMTP relay for invitation email.
+
+The default-deny policy at the top of this file covers egress as well as
+ingress, and identity-service's own rules above enumerate in-cluster lanes
+only (policy-engine, crypto-service, PostgreSQL, audit-service,
+lease-manager). The relay is outside the cluster, so without this rule every
+invitation email fails at connect — "SMTP delivery failed: Connection error:
+Network unreachable" — while the invitation itself is created and returned, so
+the console reports the person as invited and no mail arrives.
+
+Same shape as the cross-region rule above: non-private destinations only, so
+this hole cannot be used to sweep the LAN behind the cluster. Only the
+configured submission port is opened, and only when a relay is configured at
+all.
+────────────────────────────────────────────────────────────────────────────
+*/}}
+{{- with .Values.identityService.smtp }}
+{{- if .host }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" $ }}-identity-smtp-egress
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "vyltzero.componentSelectorLabels" (dict "component" "identity-service" "context" $) | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - port: {{ .port | default 587 }}
+          protocol: TCP
+{{- end }}
+{{- end }}
+
+
+{{/*
+────────────────────────────────────────────────────────────────────────────
+migrations Job: allow egress to PostgreSQL.
+
+The default-deny policy at the top of this file covers every pod in the
+namespace, and the per-service egress rules above enumerate the long-running
+services only. The schema bootstrap Job is not one of them, so without this
+rule it sits in `pg_isready` forever and the Job never completes — while the
+services it exists to unblock crash-loop on the missing schema. Observed
+exactly that on the first real deploy.
+────────────────────────────────────────────────────────────────────────────
+*/}}
+{{- if .Values.migrations.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vyltzero.fullname" . }}-migrations
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "vyltzero.componentSelectorLabels" (dict "component" "migrations" "context" $) | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - port: {{ include "vyltzero.postgresPort" . }}
+          protocol: TCP
+{{- end }}
+
+{{- end }}{{/* networkPolicies.enabled */}}

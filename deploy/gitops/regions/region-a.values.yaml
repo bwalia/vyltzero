@@ -1,0 +1,208 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# region-a — Manchester PoP, pinned to cloud001
+#
+# This is the ORIGINAL vyltzero deployment, brought under GitOps. Its values
+# must keep describing what is already running: adopting a live release with
+# drifted values would have Argo CD rewrite a working region on first sync.
+# ═══════════════════════════════════════════════════════════════════════════
+global:
+  # Fallback tag for services that do not pin their own image below —
+  # leaseManager and syncScheduler both rely on it. Bumping only the
+  # explicit `tag:` lines leaves those two on the old release, which is
+  # exactly what happened on the v1.0.8 rollout: lease-manager stayed on
+  # v1.0.6 and its HTTP router (added after that build) stayed missing,
+  # so /leases answered 404 in production.
+  imageTag: v1.0.14
+  region:
+    id: region-a
+    displayName: Manchester
+    # The region's OWN stable host, not the shared alias: vault.workstation.co.uk
+    # moves to whichever region takes default traffic on failover, so a region
+    # advertising it as its endpoint misidentifies itself the moment the alias
+    # moves. This matches what region B's roster already calls this region.
+    endpoint: https://vault-a.workstation.co.uk
+    # The full roster, identical in every region's file. Each region's chart
+    # filters its own entry out when building REPLICATION_PEERS.
+    peers: &meshPeers
+      - id: region-a
+        displayName: Manchester
+        replicationUrl: https://vault-a.workstation.co.uk
+      - id: region-b
+        displayName: London
+        replicationUrl: https://vault-b.workstation.co.uk
+
+  # Required by the PostgreSQL subchart to accept the bitnamilegacy repository
+  # pinned below; without it the subchart refuses to render.
+  security:
+    allowInsecureImages: true
+
+  scheduling:
+    nodeSelector:
+      kubernetes.io/hostname: cloud001
+    tolerations:
+      - key: node-role.kubernetes.io/edge
+        operator: Exists
+        effect: NoSchedule
+    affinity: {}
+
+  # cloud001 podCIDR 10.42.16.0/24 -> host /31
+  edgeHostCidrs: &regionAEdgeCidrs
+    - 10.42.16.0/31
+
+networkPolicies:
+  enabled: true
+  wslproxyHostIngress:
+    cidrs: *regionAEdgeCidrs
+    # 8091 replication-agent (peer pulls), 8092 region-health
+    # (/v1/sys/regions + /v1/sys/cluster, which the vault-ui Regions and
+    # Cluster pages read).
+    ports: [8081, 8082, 8083, 8084, 8086, 8087, 8088, 8091, 8092]
+
+ui:
+  enabled: true
+  image:
+    # Promoted with the rest of the mesh to release v1.0.14 (vault redesign,
+    # RLS on api_keys / MFA, invitations). Keep in lockstep with region B.
+    tag: v1.0.14
+  # Keep: the WSLProxy edge reaches this pod for vault.workstation.co.uk by
+  # sending Host: vault-ui.workstation.co.uk (rule vault-workstation-dashboard).
+  host: vault-ui.workstation.co.uk
+  ingressClassName: traefik-edge
+  entrypoint: web,websecure
+  wslproxyIngress:
+    cidrs: *regionAEdgeCidrs
+
+edgeIngress:
+  enabled: true
+  ingressClassName: traefik-edge
+  entrypoint: web,websecure
+  host: vault.workstation.co.uk
+  # vault-a… addresses THIS region specifically (peers and operators);
+  # vault.workstation.co.uk is the shared alias the PoP currently points here.
+  extraHosts:
+    - vault-a.workstation.co.uk
+    - vyltzero.workstation.co.uk
+  tls:
+    secretName: vyltzero-gateway-tls
+    hosts:
+      - vault.workstation.co.uk
+      - vyltzero.workstation.co.uk
+      - vault-a.workstation.co.uk
+
+postgresql:
+  enabled: true
+  # The live release runs the legacy Bitnami image; the current chart default
+  # points at a repository that now requires a subscription. allowInsecureImages
+  # below is what lets the subchart accept a non-default repository.
+  image:
+    registry: docker.io
+    repository: bitnamilegacy/postgresql
+  auth:
+    database: vyltzero
+    username: vyltzero
+    # The password is NOT in Git. It already lives in the vyltzero-postgresql
+    # Secret created on first install; pointing at it here keeps the running
+    # password unchanged. Rendering a different one would break every service's
+    # DATABASE_URL and lock the region out of its own data.
+    # vyltzero-db-auth is created OUTSIDE the chart by
+    # scripts/vyltzero-mesh-keys.sh db-secret. It cannot be the subchart's own
+    # vyltzero-postgresql Secret: that one carries no resource-policy:keep, so
+    # setting existingSecret makes Helm drop it from the manifest and delete
+    # the very Secret being referenced.
+    existingSecret: vyltzero-db-auth
+    secretKeys:
+      adminPasswordKey: postgres-password
+      userPasswordKey: password
+  primary:
+    persistence:
+      storageClass: local-path
+    nodeSelector:
+      kubernetes.io/hostname: cloud001
+    tolerations:
+      - key: node-role.kubernetes.io/edge
+        operator: Exists
+        effect: NoSchedule
+
+# The three shared keys arrive from a Secret provisioned out-of-band and
+# replicated to every region's namespace — never from Git. See
+# deploy/gitops/README.md for how to create it.
+# The OpenResty gateway is not deployed in this region — traefik-edge is the
+# edge and serves the public hosts directly.
+gateway:
+  enabled: false
+
+# Image tags actually running in region A. Everything that authenticates
+# callers is pinned to 2713cf4e — the first main build where identity comes
+# from the signed token (vyltzero_core::auth::resolve_identity) instead of
+# attacker-controlled X-Tenant-Id/X-Policies headers. The vault-ui at b6c8a85
+# already stopped sending those headers, so older backends answer its
+# dashboard calls with "X-Tenant-Id header is required": UI and backends must
+# move together. regionHealth stays at 9f724df (unchanged since).
+identityService:
+  replicaCount: 1
+  # -- Where invitation links point. Must be the address the RECIPIENT opens,
+  # not cluster DNS. A wrong value produces links that reach nobody, and the
+  # service cannot infer it. vault.workstation.co.uk serves the console too
+  # (the WSLProxy edge sends every non-API path to this UI); the old
+  # vault-ui.workstation.co.uk 301s there and is being retired.
+  publicUrl: "https://vault.workstation.co.uk"
+  # -- Outbound email for tenant invitations. The password is deliberately NOT
+  # here: it comes from the `smtp-password` key of the `vyltzero-mesh-keys`
+  # Secret. NOT a separate `vyltzero-smtp` Secret — setting
+  # secrets.existingSecret below redirects every key lookup in the chart to
+  # that one Secret, so a `vyltzero-smtp` Secret would never be read.
+  # Provisioned by scripts/vyltzero-mesh-keys.sh; see deploy/gitops/README.md.
+  # Leaving host empty disables sending
+  # — invitations are still created, and the link is returned to the operator
+  # to deliver by hand.
+  smtp:
+    host: smtp.gmail.com
+    port: 587
+    username: tenthmatrix.mailer@gmail.com
+    from: "VyltZero <tenthmatrix.mailer@gmail.com>"
+  image:
+    tag: v1.0.14
+regionHealth:
+  image:
+    tag: v1.0.14
+secretEngine:
+  image:
+    tag: v1.0.14
+policyEngine:
+  image:
+    tag: v1.0.14
+transitEngine:
+  image:
+    tag: v1.0.14
+auditService:
+  image:
+    tag: v1.0.14
+pkiEngine:
+  image:
+    tag: v1.0.14
+mcpServer:
+  image:
+    tag: v1.0.14
+cryptoService:
+  replicaCount: 1
+  image:
+    tag: v1.0.14
+
+# The three shared keys arrive from a Secret provisioned out-of-band and
+# replicated to every region's namespace — never from Git. Populate it with
+# region A's EXISTING key material:
+#   ./scripts/vyltzero-mesh-keys.sh adopt vyltzero
+replicationAgent:
+  # Verified guarded before enabling, against the deployed image via
+  # port-forward: no token -> 401, bogus token -> 401, mesh token -> 200,
+  # /health open for probes.
+  publishPeerEndpoint: true
+  # Pinned to the first image built from main that contains the shared-token
+  # guard in services/replication-agent/src/auth.rs. global.imageTag (0.1.0) was
+  # re-pushed with the same code, but imagePullPolicy: IfNotPresent means nodes
+  # keep the cached pre-auth layer — only a new tag actually pulls it.
+  image:
+    tag: v1.0.14
+
+secrets:
+  existingSecret: vyltzero-mesh-keys

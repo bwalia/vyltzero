@@ -1,0 +1,184 @@
+{{/*
+identity-service/deployment.yaml
+The identity-service handles tenant authentication, JWT issuance, and token
+validation. It is queried by the gateway before forwarding requests inward.
+*/}}
+{{- if .Values.identityService.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vyltzero.componentFullname" (dict "component" "identity-service" "context" $) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.componentLabels" (dict "component" "identity-service" "componentType" "auth" "context" $) | nindent 4 }}
+  {{- with .Values.identityService.podAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.identityService.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "vyltzero.componentSelectorLabels" (dict "component" "identity-service" "context" $) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "vyltzero.componentLabels" (dict "component" "identity-service" "componentType" "auth" "context" $) | nindent 8 }}
+      {{- if .Values.monitoring.enabled }}
+      annotations:
+        {{- toYaml .Values.monitoring.scrapeAnnotations | nindent 8 }}
+        prometheus.io/port: {{ .Values.identityService.httpPort | quote }}
+        {{- with .Values.identityService.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- else }}
+      {{- with .Values.identityService.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- end }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "vyltzero.serviceAccountName" . }}
+      {{- include "vyltzero.podSecurityContext" . | nindent 6 }}
+      containers:
+        - name: identity-service
+          image: {{ include "vyltzero.image" (dict "image" .Values.identityService.image "context" $) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          {{- include "vyltzero.containerSecurityContext" . | nindent 10 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.identityService.httpPort }}
+              protocol: TCP
+            - name: grpc
+              containerPort: {{ .Values.identityService.grpcPort }}
+              protocol: TCP
+          env:
+            # Its own JWKS. `GET /v1/tenants/:id` lets a member read the tenant
+            # it belongs to, which means resolving the caller's Ed25519 token
+            # through the shared verifier rather than the admin gate — and that
+            # verifier fetches public keys over HTTP like every other service.
+            # Self-referential, but the keys it needs are the ones it publishes.
+            - name: VAULT_JWKS_URL
+              value: "http://127.0.0.1:{{ .Values.identityService.httpPort }}/v1/identity/.well-known/jwks.json"
+            - name: VAULT_HTTP_ADDR
+              value: {{ printf "0.0.0.0:%v" .Values.identityService.httpPort | quote }}
+            - name: VAULT_LISTEN_ADDR
+              value: {{ printf "0.0.0.0:%v" .Values.identityService.grpcPort | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vyltzero.dbCredentialsSecretName" . }}
+                  key: {{ include "vyltzero.dbAppPasswordSecretKey" . }}
+                  optional: false
+            - name: DATABASE_URL
+              value: {{ printf "postgresql://%s:$(DB_PASSWORD)@%s:%s/%s"
+                          (include "vyltzero.dbAppUser" .)
+                          (include "vyltzero.postgresHost" .)
+                          (include "vyltzero.postgresPort" .)
+                          .Values.postgresql.auth.database }}
+            # Wraps each tenant's Ed25519 signing key, so private key material
+            # sits under the root KEK and therefore under the seal.
+            - name: CRYPTO_SERVICE_ENDPOINT
+              value: "http://{{ include "vyltzero.componentFullname" (dict "component" "crypto-service" "context" $) }}:50051"
+            # Legacy shared secret. Only used for tokens issued before
+            # per-tenant signing keys existed; remove once those have expired.
+            - name: VAULT_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vyltzero.jwtSecretName" . }}
+                  key: {{ include "vyltzero.jwtSecretKey" . }}
+                  optional: false
+            # Bootstrap credential for the API key management endpoints. Those
+            # endpoints authenticate callers themselves — minting a key grants
+            # whatever policies the request asks for, so they cannot rely on
+            # the gateway-origin check alone, which a deployment that routes
+            # around the gateway (or leaves VAULT_GATEWAY_SECRET unset) does
+            # not apply. Optional: when the key is absent the service starts
+            # with the bootstrap path disabled and accepts only JWTs carrying
+            # the administrator policy.
+            - name: VAULT_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vyltzero.adminTokenSecretName" . }}
+                  key: {{ include "vyltzero.adminTokenSecretKey" . }}
+                  optional: true
+            {{- with .Values.identityService.adminPolicy }}
+            # Policy a JWT must carry to manage API keys (default: "admin").
+            - name: VAULT_ADMIN_POLICY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.identityService.publicUrl }}
+            # Base address invitation links point at. Must be what a recipient
+            # can actually open — the service cannot infer it, and a wrong value
+            # produces links that reach nobody.
+            - name: VAULT_PUBLIC_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.identityService.smtp }}
+            {{- if .host }}
+            # Outbound email for tenant invitations. Absent host disables
+            # sending; invitations are still created and the link returned.
+            - name: SMTP_HOST
+              value: {{ .host | quote }}
+            - name: SMTP_PORT
+              value: {{ .port | default 587 | quote }}
+            {{- with .username }}
+            - name: SMTP_USERNAME
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .from }}
+            - name: SMTP_FROM
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if or .Values.secrets.smtpPassword .Values.secrets.existingSecret }}
+            # Never inlined: the password comes from the Secret, so it does not
+            # appear in the Deployment manifest or in `kubectl describe pod`.
+            - name: SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | default (printf "%s-smtp" (include "vyltzero.fullname" .)) }}
+                  key: {{ .Values.secrets.existingSecretKeys.smtpPassword | default "smtp-password" }}
+                  optional: true
+            {{- end }}
+            # gRPC address of the policy-engine for permission checks during token validation
+            - name: POLICY_ENGINE_ADDR
+              value: {{ printf "%s:%s"
+                          (include "vyltzero.componentFullname" (dict "component" "policy-engine" "context" $))
+                          (.Values.policyEngine.grpcPort | toString) }}
+            - name: LEASE_MANAGER_ENDPOINT
+              value: {{ printf "http://%s:%s"
+                          (include "vyltzero.componentFullname" (dict "component" "lease-manager" "context" $))
+                          (.Values.leaseManager.grpcPort | toString) }}
+            {{- with .Values.identityService.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.identityService.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- include "vyltzero.podScheduling" (dict "service" .Values.identityService "context" $) | nindent 6 }}
+{{- end }}

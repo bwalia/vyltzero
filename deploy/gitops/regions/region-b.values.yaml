@@ -1,0 +1,243 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# region-b — second region, pinned to cloud003 (London PoP)
+#
+# A complete, independent vyltzero stack: its own PostgreSQL, its own service
+# set, its own public hostnames. It is paired with region-a only through the
+# `peers` roster below — each region's replication-agent polls the other's
+# /v1/replication/events over the public edge and applies the events locally.
+#
+# WHY cloud003 AND NOT vps002
+#   vps002 was the original choice, but as of 2026-08-29 it cannot run this
+#   stack: its node-local CoreDNS pod has never gone Ready (its readiness probe
+#   503s because CoreDNS cannot reach the API server — the `kubernetes` Service
+#   endpoints are LAN addresses vps002 has no route to). kube-dns is
+#   internalTrafficPolicy: Local, so there is no fallback to another node's
+#   CoreDNS: pods on vps002 resolve nothing and ClusterIP times out. Every
+#   service here addresses PostgreSQL and its siblings by in-cluster DNS.
+#
+#   cloud003 has the same isolation profile as cloud001 (edge taint,
+#   cross-node=unavailable, traefik-edge, local-path) with working DNS, and is
+#   a genuinely separate site (net-region=london vs cloud001's manchester).
+#
+#   To move to vps002 once its LAN route is restored, change the two
+#   nodeSelector hostnames below and edgeHostCidrs to 10.42.17.0/31.
+#   See docs/ha-two-region.md §5.0.
+# ═══════════════════════════════════════════════════════════════════════════
+global:
+  # Fallback tag for services that do not pin their own image below —
+  # leaseManager and syncScheduler both rely on it. Bumping only the
+  # explicit `tag:` lines leaves those two on the old release, which is
+  # exactly what happened on the v1.0.8 rollout: lease-manager stayed on
+  # v1.0.6 and its HTTP router (added after that build) stayed missing,
+  # so /leases answered 404 in production.
+  imageTag: v1.0.14
+  region:
+    id: region-b
+    displayName: London
+    endpoint: https://vault-b.workstation.co.uk
+    # Identical roster to region-a's file; the chart drops the local entry.
+    peers:
+      - id: region-a
+        displayName: Manchester
+        replicationUrl: https://vault-a.workstation.co.uk
+      - id: region-b
+        displayName: London
+        replicationUrl: https://vault-b.workstation.co.uk
+
+  # Required by the PostgreSQL subchart to accept the bitnamilegacy repository.
+  security:
+    allowInsecureImages: true
+
+  scheduling:
+    nodeSelector:
+      kubernetes.io/hostname: cloud003
+    tolerations:
+      - key: node-role.kubernetes.io/edge
+        operator: Exists
+        effect: NoSchedule
+    affinity: {}
+
+  # cloud003 podCIDR 10.42.0.0/24 -> host /31, covering both the flannel.1 .0
+  # and cni0 .1 source addresses.
+  edgeHostCidrs: &regionBEdgeCidrs
+    - 10.42.0.0/31
+
+networkPolicies:
+  enabled: true
+  wslproxyHostIngress:
+    cidrs: *regionBEdgeCidrs
+    # 8091 replication-agent (peer pulls), 8092 region-health
+    # (/v1/sys/regions + /v1/sys/cluster, which the vault-ui Regions and
+    # Cluster pages read).
+    ports: [8081, 8082, 8083, 8084, 8086, 8087, 8088, 8091, 8092]
+
+ui:
+  enabled: true
+  image:
+    # Promoted with the rest of the mesh to release v1.0.14 (vault redesign,
+    # RLS on api_keys / MFA, invitations). Keep in lockstep with region A.
+    tag: v1.0.14
+  # Renamed 2026-08-31 from vault-ui-b.workstation.co.uk (Chrome objected to
+  # the old name on the login page). The old host stays as an alias so existing
+  # bookmarks and links keep working; both CNAME to pop0 and share the
+  # vyltzero-region-b-cloud003 PoP rule.
+  host: vault-ha.workstation.co.uk
+  extraHosts:
+    - vault-ui-b.workstation.co.uk
+  ingressClassName: traefik-edge
+  entrypoint: web,websecure
+  wslproxyIngress:
+    cidrs: *regionBEdgeCidrs
+
+edgeIngress:
+  enabled: true
+  ingressClassName: traefik-edge
+  entrypoint: web,websecure
+  host: vault-b.workstation.co.uk
+  # NOTE: the shared alias vault.workstation.co.uk is deliberately NOT listed
+  # here. traefik-edge is one DaemonSet watching Ingresses cluster-wide, so a
+  # host claimed by two Ingresses is ambiguous: with the alias on both regions,
+  # traefik-edge on cloud003 resolved it to region A's Services and hung,
+  # because cloud003 has no pod-network route to cloud001.
+  #
+  # Exactly one region may claim the alias at a time. Failing over is therefore
+  # two coordinated changes: move the alias from region A's extraHosts to this
+  # list, and repoint the PoP origin for it at cloud003. The per-region hosts
+  # (vault-a…/vault-b…) are unambiguous and always work.
+  extraHosts: []
+  tls:
+    # Region B has no certificate of its own yet; traefik-edge serves these
+    # hosts over the web entrypoint and the PoP terminates TLS. Point this at a
+    # cert-manager secret when region B gets a trusted chain.
+    secretName: vyltzero-b-gateway-tls
+    hosts:
+      - vault-b.workstation.co.uk
+      - vault.workstation.co.uk
+
+postgresql:
+  enabled: true
+  # Same legacy image as region A; the current chart default points at a
+  # repository that now requires a subscription.
+  image:
+    registry: docker.io
+    repository: bitnamilegacy/postgresql
+  auth:
+    database: vyltzero
+    username: vyltzero
+    # Created outside the chart, per region, by
+    #   ./scripts/vyltzero-mesh-keys.sh db-secret vyltzero-b --generate
+    # Unlike the mesh keys this is NOT shared between regions: each region has
+    # its own PostgreSQL.
+    existingSecret: vyltzero-db-auth
+    secretKeys:
+      adminPasswordKey: postgres-password
+      userPasswordKey: password
+  primary:
+    persistence:
+      # Node-local storage: longhorn does not schedule on the edge nodes, and a
+      # region must not depend on cross-node replica traffic.
+      storageClass: local-path
+    nodeSelector:
+      kubernetes.io/hostname: cloud003
+    tolerations:
+      - key: node-role.kubernetes.io/edge
+        operator: Exists
+        effect: NoSchedule
+
+# Same mesh Secret as region A, replicated into this namespace. The root key,
+# JWT secret, PKI root key and replication peer token must be byte-identical
+# across regions or replicated ciphertext will not decrypt and peer polls will
+# 401.
+# traefik-edge is the edge here too; the OpenResty gateway is not deployed.
+gateway:
+  enabled: false
+
+replicationAgent:
+  # Verified guarded before enabling, against the deployed image via
+  # port-forward: no token -> 401, bogus token -> 401, mesh token -> 200,
+  # /health open for probes.
+  publishPeerEndpoint: true
+  # Pinned to the first image built from main that contains the shared-token
+  # guard in services/replication-agent/src/auth.rs. global.imageTag (0.1.0) was
+  # re-pushed with the same code, but imagePullPolicy: IfNotPresent means nodes
+  # keep the cached pre-auth layer — only a new tag actually pulls it.
+  image:
+    tag: v1.0.14
+
+secrets:
+  existingSecret: vyltzero-mesh-keys
+
+# Single-replica constraints carry over: crypto-service caches DEKs in-process
+# and identity-service still keeps its principal store in a HashMap.
+cryptoService:
+  replicaCount: 1
+  image:
+    tag: v1.0.14
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Image pins, matched to region A.
+#
+# Both regions must run the SAME code — they are an active/active pair and the
+# shared alias can point at either. Region A had been pinned to newer builds
+# while this region took the global.imageTag default (0.1.0), so four
+# components silently diverged and region B ran OLDER code.
+#
+# secret-engine was the dangerous one: only region A carried the lookup-self
+# fix that External Secrets Operator needs to validate a store. Verified live,
+# same token through each region's edge, before this change:
+#
+#   vault-a  /v1/auth/token/lookup-self -> type=service, expire_time, ttl
+#   vault-b  /v1/auth/token/lookup-self -> all three ABSENT
+#
+# Failing the alias over to region B would have broken ESO cluster-wide.
+# scripts/validate-gitops.sh now fails on any such drift.
+# ─────────────────────────────────────────────────────────────────────────────
+# Everything that authenticates callers is pinned to 2713cf4e — the first
+# main build where identity comes from the signed token instead of
+# attacker-controlled X-Tenant-Id/X-Policies headers, matching the b6c8a85
+# vault-ui that no longer sends them. regionHealth stays at 9f724df
+# (unchanged since).
+identityService:
+  replicaCount: 1
+  # -- Where invitation links point. Must be the address the RECIPIENT opens,
+  # which is this region's UI host, not the API host and not cluster DNS. A
+  # wrong value produces links that reach nobody, and the service cannot infer
+  # it.
+  publicUrl: "https://vault-ha.workstation.co.uk"
+  # -- Outbound email for tenant invitations. The password is deliberately NOT
+  # here: it comes from the `smtp-password` key of the `vyltzero-mesh-keys`
+  # Secret. NOT a separate `vyltzero-smtp` Secret — setting
+  # secrets.existingSecret below redirects every key lookup in the chart to
+  # that one Secret, so a `vyltzero-smtp` Secret would never be read.
+  # Provisioned by scripts/vyltzero-mesh-keys.sh; see deploy/gitops/README.md.
+  # Leaving host empty disables sending
+  # — invitations are still created, and the link is returned to the operator
+  # to deliver by hand.
+  smtp:
+    host: smtp.gmail.com
+    port: 587
+    username: tenthmatrix.mailer@gmail.com
+    from: "VyltZero <tenthmatrix.mailer@gmail.com>"
+  image:
+    tag: v1.0.14
+regionHealth:
+  image:
+    tag: v1.0.14
+secretEngine:
+  image:
+    tag: v1.0.14
+policyEngine:
+  image:
+    tag: v1.0.14
+transitEngine:
+  image:
+    tag: v1.0.14
+auditService:
+  image:
+    tag: v1.0.14
+pkiEngine:
+  image:
+    tag: v1.0.14
+mcpServer:
+  image:
+    tag: v1.0.14

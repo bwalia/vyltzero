@@ -1,0 +1,316 @@
+# VyltZero Local Development Environment
+# Usage: docker compose up -d
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: vyltzero
+      POSTGRES_USER: vyltzero
+      POSTGRES_PASSWORD: devpassword
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./storage/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vyltzero"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  crypto-service:
+    build:
+      context: .
+      dockerfile: deploy/docker/crypto-service/Dockerfile
+    environment:
+      DATABASE_URL: "postgres://vyltzero:devpassword@postgres:5432/vyltzero"
+      VAULT_ROOT_KEY: "d3NsdmF1bHQtZGV2LXJvb3QtMzItYnl0ZXMta2V5ISE="  # base64("vyltzero-dev-root-32-bytes-key!!" = 32 bytes)
+      VAULT_LISTEN_ADDR: "0.0.0.0:8080"
+      RUST_LOG: "info,crypto_service=debug"
+    ports:
+      - "50051:50051"
+      - "18080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  secret-engine:
+    build:
+      context: .
+      dockerfile: deploy/docker/secret-engine/Dockerfile
+    environment:
+      DATABASE_URL: "postgres://vyltzero:devpassword@postgres:5432/vyltzero"
+      CRYPTO_SERVICE_ENDPOINT: "http://crypto-service:50051"
+      VAULT_LISTEN_ADDR: "0.0.0.0:8081"
+      REGION_ID: "local"
+      RUST_LOG: "info,secret_engine=debug"
+    ports:
+      - "50052:50052"
+      - "8081:8081"
+    depends_on:
+      crypto-service:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+  identity-service:
+    build:
+      context: .
+      dockerfile: deploy/docker/identity-service/Dockerfile
+    environment:
+      # DATABASE_URL intentionally omitted: identity-service uses in-memory stores
+      # (TenantStoreState falls back to in-memory when DATABASE_URL is absent)
+      VAULT_JWT_SECRET: "dev-jwt-secret-change-in-production"
+      VAULT_LISTEN_ADDR: "0.0.0.0:50054"
+      VAULT_HTTP_ADDR: "0.0.0.0:8082"
+      RUST_LOG: "info,identity_service=debug"
+    ports:
+      - "15054:50054"
+      - "18082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  policy-engine:
+    build:
+      context: .
+      dockerfile: deploy/docker/policy-engine/Dockerfile
+    environment:
+      # DATABASE_URL intentionally omitted: policy-engine uses in-memory store
+      # to match identity-service (tenants are in-memory; DB FK constraint would
+      # reject policies for tenants not yet persisted to system.tenants).
+      VAULT_LISTEN_ADDR: "0.0.0.0:50053"
+      VAULT_HEALTH_ADDR: "0.0.0.0:8083"
+      RUST_LOG: "info,policy_engine=debug"
+    ports:
+      - "50053:50053"
+      - "8083:8083"
+
+  transit-engine:
+    build:
+      context: .
+      dockerfile: deploy/docker/transit-engine/Dockerfile
+    environment:
+      DATABASE_URL: "postgres://vyltzero:devpassword@postgres:5432/vyltzero"
+      VAULT_LISTEN_ADDR: "0.0.0.0:8086"
+      RUST_LOG: "info,transit_engine=debug"
+    ports:
+      - "18086:8086"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  pki-engine:
+    build:
+      context: .
+      dockerfile: deploy/docker/pki-engine/Dockerfile
+    environment:
+      DATABASE_URL: "postgres://vyltzero:devpassword@postgres:5432/vyltzero"
+      # Dev-only key; production must supply a KMS-managed value.
+      PKI_ROOT_KEY: "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq8M="
+      RUST_LOG: "info,pki_engine=debug"
+    ports:
+      - "18088:8088"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  lease-manager:
+    build:
+      context: .
+      dockerfile: deploy/docker/lease-manager/Dockerfile
+    environment:
+      DATABASE_URL: "postgres://vyltzero:devpassword@postgres:5432/vyltzero"
+      VAULT_LISTEN_ADDR: "0.0.0.0:8084"
+      RUST_LOG: "info,lease_manager=debug"
+    ports:
+      - "15055:50055"
+      - "18084:8084"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  audit-service:
+    build:
+      context: .
+      dockerfile: deploy/docker/audit-service/Dockerfile
+    environment:
+      DATABASE_URL: "postgres://vyltzero:devpassword@postgres:5432/vyltzero"
+      VAULT_AUDIT_SIGNING_KEY: "dev-audit-signing-key-32bytes!"
+      VAULT_LISTEN_ADDR: "0.0.0.0:8085"
+      RUST_LOG: "info,audit_service=debug"
+    ports:
+      - "15056:50056"
+      - "18085:8085"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  mcp-server:
+    build:
+      context: .
+      dockerfile: deploy/docker/mcp-server/Dockerfile
+    environment:
+      VAULT_SECRET_ENGINE_ADDR: "http://secret-engine:8081"
+      VAULT_LISTEN_ADDR: "0.0.0.0:8087"
+      RUST_LOG: "info,mcp_server=debug"
+    ports:
+      - "8087:8087"
+    depends_on:
+      - secret-engine
+
+  # Credential broker for AI agents. Agents send their session token, never an
+  # upstream key; the proxy injects the real one. See docs/agent-proxy.md.
+  agent-proxy:
+    build:
+      context: .
+      dockerfile: deploy/docker/agent-proxy/Dockerfile
+    environment:
+      VAULT_LISTEN_ADDR: "0.0.0.0:8094"
+      VAULT_SECRET_ENGINE_ADDR: "http://secret-engine:8081"
+      VAULT_JWT_SECRET: "dev-jwt-secret-change-in-production"
+      # Dev: mint a token for the broker (tenant `default`, policy granting
+      # read on brokered/**) and export it before `docker compose up`.
+      VAULT_AGENT_PROXY_TOKEN: "${VAULT_AGENT_PROXY_TOKEN:-}"
+      VAULT_AGENT_PROXY_ROUTES_FILE: "/etc/agent-proxy/routes.json"
+      RUST_LOG: "info,agent_proxy=debug"
+    volumes:
+      - ./examples/agent-proxy/routes.json:/etc/agent-proxy/routes.json:ro
+    ports:
+      - "8094:8094"
+    depends_on:
+      - secret-engine
+
+  replication-agent:
+    build:
+      context: .
+      dockerfile: deploy/docker/replication-agent/Dockerfile
+    environment:
+      DATABASE_URL: "postgres://vyltzero:devpassword@postgres:5432/vyltzero"
+      REGION_ID: "local"
+      # No peers in single-node dev; set to "region-b=http://replication-agent-b:8091"
+      # in a multi-node compose override.
+      REPLICATION_PEERS: ""
+      REPLICATION_LISTEN_ADDR: "0.0.0.0:8091"
+      REPLICATION_POLL_INTERVAL_MS: "500"
+      REPLICATION_BATCH_SIZE: "100"
+      REPLICATION_CONFLICT_STRATEGY: "last_write_wins"
+      RUST_LOG: "info,replication_agent=debug"
+    ports:
+      - "18091:8091"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8091/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  region-health:
+    build:
+      context: .
+      dockerfile: deploy/docker/region-health/Dockerfile
+    environment:
+      DATABASE_URL: "postgres://vyltzero:devpassword@postgres:5432/vyltzero"
+      REGION_ID: "local"
+      REGION_HEALTH_LISTEN_ADDR: "0.0.0.0:8092"
+      RUST_LOG: "info,region_health=debug"
+    ports:
+      - "18092:8092"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8092/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  sync-scheduler:
+    build:
+      context: .
+      dockerfile: deploy/docker/sync-scheduler/Dockerfile
+    environment:
+      DATABASE_URL: "postgres://vyltzero:devpassword@postgres:5432/vyltzero"
+      REGION_ID: "local"
+      SYNC_SCHEDULER_LISTEN_ADDR: "0.0.0.0:8093"
+      RUST_LOG: "info,sync_scheduler=debug"
+    ports:
+      - "18093:8093"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8093/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  gateway:
+    image: openresty/openresty:1.25.3.2-alpine
+    ports:
+      - "8443:443"
+      - "8088:8080"
+    volumes:
+      - ./gateway/conf.d/main.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+      - ./gateway/lua:/etc/openresty/lua:ro
+    depends_on:
+      - secret-engine
+      - identity-service
+      - policy-engine
+      - crypto-service
+      - transit-engine
+      - lease-manager
+      - audit-service
+      - mcp-server
+
+  # ── Monitoring Stack ─────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/monitoring/prometheus/alerts:/etc/prometheus/alerts:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    depends_on:
+      - crypto-service
+      - secret-engine
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: vyltzero-dev
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./deploy/monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./deploy/monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./deploy/monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  pgdata:
+  prometheus_data:
+  grafana_data:

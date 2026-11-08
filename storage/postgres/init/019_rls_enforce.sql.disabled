@@ -1,0 +1,81 @@
+-- VyltZero: SUPERSEDED. The work this file described now lives in 029.
+-- ** STILL NOT APPLIED — see the .disabled suffix. Do not rename it. **
+--
+-- Kept rather than deleted because it records a claim that turned out to be
+-- wrong in a way that matters, and because the FORCE step at the bottom is the
+-- one piece of it that has not shipped.
+--
+-- ## What moved to 029_rls_enforce.sql
+--
+--   * Creating `vyltzero_app` -> deploy/helm/vyltzero/files/bootstrap/rls_app_role.sql.
+--     It could not stay in a migration: the migration Job connects as
+--     `vyltzero`, which has neither SUPERUSER nor CREATEROLE in the live
+--     regions, so CREATE ROLE fails there.
+--   * The GRANTs and ALTER DEFAULT PRIVILEGES -> 029, guarded on the role
+--     existing so the migration is complete either way.
+--   * RLS coverage for the tenant-scoped tables 004 and 011 missed entirely
+--     (secret_rotations, tenant_quotas, scim_group_members, key_descriptors,
+--     tenant_signing_keys, revoked_tokens, sync_jobs, tenant_schemas) -> 029.
+--
+-- It could not simply be renamed to `019_rls_enforce.sql`, either: migrate.sh
+-- applies files once, in name order, by checksum. A new 019 would run before
+-- 020-028 on a fresh database and after them on the live ones, so the two would
+-- diverge on exactly the tables involved.
+--
+-- ## The claim that was wrong
+--
+-- This file said, and 018 said before it, that FORCE ROW LEVEL SECURITY would
+-- "change nothing at all" because `vyltzero` is a superuser with BYPASSRLS.
+-- That is true of the local docker-compose database, where the postgres image
+-- makes POSTGRES_USER a superuser. It is NOT true of the live regions, which
+-- run the Bitnami chart. Checked against region A:
+--
+--     SELECT rolname, rolsuper, rolbypassrls FROM pg_roles;
+--      postgres | t | t
+--      vyltzero | f | f      <-- neither
+--
+-- `vyltzero` is exempt there for one reason only: it owns the tables. So in
+-- production FORCE was never a formality — it was the live switch, and applying
+-- it "to see if anything changes" would have made every fail-closed policy match
+-- zero rows and taken both regions down. The safe-looking step was the dangerous
+-- one. That is why 029 does everything EXCEPT force.
+--
+-- ## What is actually left
+--
+-- Enforcement does not need FORCE. PostgreSQL applies RLS to any role that is
+-- neither the table owner nor a superuser/BYPASSRLS role, so pointing the
+-- services at `vyltzero_app` is the switch:
+--
+--     postgresql.appRole.username: vyltzero_app
+--
+-- FORCE is only needed to also constrain `vyltzero` itself — the migration Job
+-- and anyone at a psql prompt. That is worth having, but it is defence in depth,
+-- not the mechanism, and it must come after the switch rather than before it.
+--
+-- Before setting appRole.username, EVERY service that touches a row-level
+-- secured table has to open a scope (vyltzero_storage::tenant_scope). Wired so
+-- far: secret-engine, replication-agent, lease-manager. Not yet wired:
+-- identity-service, crypto-service, transit-engine, policy-engine,
+-- sync-scheduler, and the audit writer in vyltzero-storage. Flipping the switch
+-- before those are done does not raise an error — the policies fail closed, so
+-- those services quietly see an empty database. See docs/tenancy.md.
+
+-- =============================================================================
+-- The remaining step, for when the switch has been made and has held
+-- =============================================================================
+-- Removes the owner exemption, so `vyltzero` is constrained too. Apply as a new
+-- numbered migration (030) at that point, not by renaming this file.
+
+-- ALTER TABLE shared.secrets          FORCE ROW LEVEL SECURITY;
+-- ALTER TABLE shared.secret_versions  FORCE ROW LEVEL SECURITY;
+-- ALTER TABLE shared.secret_rotations FORCE ROW LEVEL SECURITY;
+-- ALTER TABLE shared.leases           FORCE ROW LEVEL SECURITY;
+-- ALTER TABLE shared.policies         FORCE ROW LEVEL SECURITY;
+-- ALTER TABLE shared.audit_events     FORCE ROW LEVEL SECURITY;
+-- ALTER TABLE shared.principals       FORCE ROW LEVEL SECURITY;
+-- ALTER TABLE shared.api_keys         FORCE ROW LEVEL SECURITY;
+-- ALTER TABLE shared.scim_users       FORCE ROW LEVEL SECURITY;
+-- ALTER TABLE shared.scim_groups      FORCE ROW LEVEL SECURITY;
+--
+-- NOTE: the migration Job runs as the owner and would be constrained by this.
+-- Any migration that touches tenant rows after 030 must set app.bypass_rls.

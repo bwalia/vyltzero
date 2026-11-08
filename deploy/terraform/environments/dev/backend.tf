@@ -1,0 +1,39 @@
+###############################################################################
+# VyltZero — Dev Environment Remote State Backend
+#
+# Uses an S3 bucket for state storage with server-side encryption and a
+# DynamoDB table for state-locking to prevent concurrent runs from corrupting
+# state.
+#
+# Prerequisites (create once, outside Terraform):
+#   aws s3api create-bucket \
+#     --bucket vyltzero-terraform-state \
+#     --region us-east-1 \
+#     --create-bucket-configuration LocationConstraint=us-east-1
+#
+#   aws s3api put-bucket-versioning \
+#     --bucket vyltzero-terraform-state \
+#     --versioning-configuration Status=Enabled
+#
+#   aws s3api put-bucket-encryption \
+#     --bucket vyltzero-terraform-state \
+#     --server-side-encryption-configuration \
+#       '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms"}}]}'
+#
+#   aws dynamodb create-table \
+#     --table-name vyltzero-terraform-locks \
+#     --attribute-definitions AttributeName=LockID,AttributeType=S \
+#     --key-schema AttributeName=LockID,KeyType=HASH \
+#     --billing-mode PAY_PER_REQUEST \
+#     --region us-east-1
+###############################################################################
+
+terraform {
+  backend "s3" {
+    bucket         = "vyltzero-terraform-state"
+    key            = "environments/dev/terraform.tfstate"
+    region         = "us-east-1"
+    encrypt        = true
+    dynamodb_table = "vyltzero-terraform-locks"
+  }
+}

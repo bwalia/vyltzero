@@ -1,0 +1,129 @@
+syntax = "proto3";
+package vyltzero.identity.v1;
+
+service IdentityService {
+  rpc Authenticate(AuthenticateRequest) returns (AuthenticateResponse);
+  rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
+  rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
+  rpc RevokeTokenByHash(RevokeTokenByHashRequest) returns (RevokeTokenByHashResponse);
+  rpc CreateServiceAccount(CreateServiceAccountRequest) returns (CreateServiceAccountResponse);
+  rpc ListServiceAccounts(ListServiceAccountsRequest) returns (ListServiceAccountsResponse);
+}
+
+message AuthenticateRequest {
+  string tenant_id = 1;
+  oneof method {
+    TokenAuth token = 2;
+    OidcAuth oidc = 3;
+    MtlsAuth mtls = 4;
+    AwsIamAuth aws_iam = 5;
+    AzureWorkloadAuth azure_workload = 6;
+  }
+}
+
+message TokenAuth {
+  string token = 1;
+}
+
+message OidcAuth {
+  string provider = 1;
+  string id_token = 2;
+}
+
+message MtlsAuth {
+  string certificate_pem = 1;
+}
+
+// AWS IAM authentication via STS GetCallerIdentity.
+// The client signs an STS request and sends the headers; the server replays
+// the call to verify the caller's AWS identity.
+message AwsIamAuth {
+  // The signed STS request URL (always https://sts.amazonaws.com/).
+  string iam_request_url = 1;
+  // Base64-encoded body of the signed STS GetCallerIdentity request.
+  string iam_request_body = 2;
+  // JSON-encoded map of the signed request headers (Authorization,
+  // X-Amz-Date, X-Amz-Security-Token, etc.).
+  string iam_request_headers = 3;
+  // Optional: IAM role ARN the caller claims to have. Cross-checked against
+  // the STS response. If empty, any valid IAM identity is accepted.
+  string bound_iam_role_arn = 4;
+}
+
+// Azure Workload Identity / Managed Identity authentication.
+// The client sends a JWT obtained from the Azure IMDS token endpoint.
+message AzureWorkloadAuth {
+  // JWT obtained from Azure IMDS (169.254.169.254) or workload identity
+  // webhook, with the audience set to the VyltZero resource URI.
+  string jwt = 1;
+  // Azure AD tenant ID the caller claims to belong to. Cross-checked
+  // against the token's `tid` claim.
+  string azure_tenant_id = 2;
+  // Optional: expected subscription ID for additional validation.
+  string subscription_id = 3;
+}
+
+message AuthenticateResponse {
+  string token = 1;
+  string principal_id = 2;
+  string tenant_id = 3;
+  repeated string policies = 4;
+  int64 expires_at = 5;
+  string lease_id = 6;
+}
+
+message ValidateTokenRequest {
+  string token = 1;
+}
+
+message ValidateTokenResponse {
+  bool valid = 1;
+  string principal_id = 2;
+  string tenant_id = 3;
+  repeated string policies = 4;
+}
+
+message RevokeTokenRequest {
+  string token = 1;
+}
+
+message RevokeTokenResponse {}
+
+// Used by lease-manager on token lease revoke/expire. The hash is SHA-256 of
+// the raw JWT, hex-encoded — never the token itself.
+message RevokeTokenByHashRequest {
+  string token_hash = 1;
+  string tenant_id = 2;
+  string principal_id = 3;
+  int64 expires_at = 4;
+}
+
+message RevokeTokenByHashResponse {}
+
+message CreateServiceAccountRequest {
+  string tenant_id = 1;
+  string name = 2;
+  repeated string policies = 3;
+  int64 ttl_seconds = 4;
+}
+
+message CreateServiceAccountResponse {
+  string principal_id = 1;
+  string token = 2;
+  string lease_id = 3;
+}
+
+message ListServiceAccountsRequest {
+  string tenant_id = 1;
+}
+
+message ListServiceAccountsResponse {
+  repeated ServiceAccountInfo accounts = 1;
+}
+
+message ServiceAccountInfo {
+  string principal_id = 1;
+  string name = 2;
+  repeated string policies = 3;
+  string created_at = 4;
+}

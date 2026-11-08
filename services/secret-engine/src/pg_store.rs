@@ -1,0 +1,579 @@
+//! PostgreSQL-backed secret store using the `vyltzero-storage` crate.
+//!
+//! `PgSecretBackend` implements `SecretStoreBackend` by delegating every
+//! operation to the free-standing async functions in
+//! `vyltzero_storage::secret_store`.  It is selected at startup when the
+//! `DATABASE_URL` environment variable is present; the in-memory `KvStore`
+//! is used as a fallback for development and testing environments where no
+//! database is available.
+
+use std::collections::HashMap;
+
+use async_trait::async_trait;
+use tracing::warn;
+use vyltzero_core::types::secret::{SecretEngine, SecretEnvironment};
+use vyltzero_core::types::tenant::TenantId;
+use vyltzero_core::VaultError;
+use vyltzero_storage::pool::DbPool;
+use vyltzero_storage::secret_store;
+
+use vyltzero_storage::quota_store;
+
+use crate::kv_store::{RotationInfo, SecretEntry, SecretStoreBackend, VersionEntry, VersionMeta};
+
+/// Resolve the caller's `versions` argument for a soft delete.
+///
+/// An empty slice means "the current live version", matching KV v2 semantics
+/// and the in-memory [`crate::kv_store::KvStore`] backend.
+///
+/// This *must* be resolved to concrete version numbers before reaching SQL.
+/// The stored function filters with `version = ANY($2)`, and `= ANY('{}')` is
+/// false for every row — so forwarding an empty array updates nothing, returns
+/// a row count of 0, and the handler answers `200 {"count":0}`. The caller sees
+/// a success and the secret is still there. Returning an empty vec here means
+/// "nothing to do"; it never means "everything".
+fn resolve_soft_delete_targets(requested: &[u32], current_version: u32) -> Vec<u32> {
+    if !requested.is_empty() {
+        return requested.to_vec();
+    }
+    // current_version is 0 only when a metadata row exists with no live version.
+    if current_version == 0 {
+        return Vec::new();
+    }
+    vec![current_version]
+}
+
+/// Resolve the caller's `versions` argument for a destroy.
+///
+/// An empty slice means "every version not already destroyed", matching the
+/// in-memory backend. `live_versions` is consulted only in that case. See
+/// [`resolve_soft_delete_targets`] for why the empty case cannot reach SQL.
+fn resolve_destroy_targets(requested: &[u32], live_versions: &[u32]) -> Vec<u32> {
+    if !requested.is_empty() {
+        return requested.to_vec();
+    }
+    live_versions.to_vec()
+}
+
+/// PostgreSQL-backed secret store.
+///
+/// Each method parses the caller-supplied `tenant_id` string into the
+/// strongly-typed `TenantId` newtype and then delegates to the corresponding
+/// `vyltzero_storage::secret_store` function.  The `DbPool` is `Clone` so
+/// `PgSecretBackend` can be cheaply wrapped in an `Arc` and shared across
+/// the gRPC and HTTP servers.
+#[derive(Debug, Clone)]
+pub struct PgSecretBackend {
+    pool: DbPool,
+    /// Region identifier for tagging replication events. Loaded from `REGION_ID` env.
+    region_id: String,
+}
+
+impl PgSecretBackend {
+    /// Create a new backend from an existing connection pool.
+    pub fn new(pool: DbPool) -> Self {
+        let region_id = std::env::var("REGION_ID").unwrap_or_else(|_| "default".to_string());
+        Self { pool, region_id }
+    }
+
+    /// Write a replication event to the outbox table for cross-region sync.
+    async fn emit_replication_event(
+        &self,
+        tenant_id: &str,
+        path: &str,
+        ciphertext: &str,
+        dek_id: &str,
+    ) -> Result<(), VaultError> {
+        let payload = serde_json::json!({
+            "tenant_id": tenant_id,
+            "path": path,
+            "ciphertext": ciphertext,
+            "dek_id": dek_id,
+        });
+
+        sqlx::query(
+            r#"
+            INSERT INTO system.replication_events (event_type, source_region, payload)
+            VALUES ('secret_upsert', $1, $2)
+            "#,
+        )
+        .bind(&self.region_id)
+        .bind(payload)
+        .execute(self.pool.inner())
+        .await
+        .map_err(|e| VaultError::Database {
+            reason: format!("replication event write failed: {}", e),
+        })?;
+
+        Ok(())
+    }
+
+    /// Parse a raw tenant-id string into the `TenantId` newtype, returning a
+    /// structured validation error on failure instead of a generic string error.
+    fn parse_tenant_id(tenant_id: &str) -> Result<TenantId, VaultError> {
+        tenant_id.parse().map_err(|_| VaultError::ValidationError {
+            field: "tenant_id".into(),
+            reason: format!("'{}' is not a valid UUID", tenant_id),
+        })
+    }
+}
+
+#[async_trait]
+impl SecretStoreBackend for PgSecretBackend {
+    /// Read a secret version from PostgreSQL.
+    ///
+    /// When `version` is `None`, resolves the latest version that is neither
+    /// soft-deleted nor destroyed — mirroring `SecretEntry::current_version_number()`
+    /// in the in-memory backend.
+    ///
+    /// It deliberately does NOT use `meta.current_version`. That column is a
+    /// write pointer that `vault_soft_delete_versions` never moves back, so it
+    /// keeps naming a version after that version has been deleted. Reading
+    /// through it returned the plaintext of a secret the caller had just
+    /// deleted — the delete appeared to do nothing.
+    ///
+    /// An explicitly requested `Some(version)` is returned even when
+    /// soft-deleted (only `destroyed` is an error), matching the in-memory
+    /// backend and leaving room for undelete.
+    async fn get(
+        &self,
+        tenant_id: &str,
+        path: &str,
+        version: Option<u32>,
+    ) -> Result<VersionEntry, VaultError> {
+        let tid = Self::parse_tenant_id(tenant_id)?;
+        // One scope for all three queries. Besides setting the tenant that RLS
+        // resolves against, it makes the metadata read, the version resolution
+        // and the version fetch a consistent snapshot — previously a concurrent
+        // delete between the second and third query could return a version the
+        // second had just certified as live.
+        let mut scope = self.pool.begin_tenant(&tid).await?;
+        let meta = secret_store::get_secret_metadata(scope.conn(), &tid, path).await?;
+
+        let target_version = match version {
+            Some(v) => v,
+            None => secret_store::latest_live_version(scope.conn(), &meta.id).await?,
+        };
+
+        if target_version == 0 {
+            // Every version is deleted or destroyed — the secret reads as absent.
+            return Err(VaultError::SecretNotFound {
+                path: path.to_string(),
+                version: None,
+            });
+        }
+
+        let sv = secret_store::get_secret_version(scope.conn(), &meta.id, target_version).await?;
+        scope.commit().await?;
+
+        Ok(VersionEntry {
+            version: sv.version,
+            ciphertext: sv.ciphertext,
+            dek_id: sv.dek_id,
+            created_at: sv.created_at,
+            deleted_at: sv.deleted_at,
+            destroyed: sv.destroyed,
+            custom_metadata: sv.custom_metadata,
+        })
+    }
+
+    /// Write a new secret version to PostgreSQL via the atomic upsert function.
+    ///
+    /// Before writing, an advisory quota check is performed against
+    /// `shared.tenant_quotas` to reject obviously over-quota writes early.
+    /// The `max_versions` argument defaults to 10 when not provided.  The
+    /// `cas_required` flag on the secret row is set to `true` whenever a
+    /// check-and-set version is supplied by the caller.
+    async fn put(
+        &self,
+        tenant_id: &str,
+        path: &str,
+        ciphertext: String,
+        dek_id: String,
+        cas: Option<u32>,
+        custom_metadata: HashMap<String, String>,
+        max_versions: Option<u32>,
+    ) -> Result<(String, u32), VaultError> {
+        let tid = Self::parse_tenant_id(tenant_id)?;
+        let mut scope = self.pool.begin_tenant(&tid).await?;
+
+        // Advisory quota check — reject writes that would exceed tenant limits.
+        // Inside the scope: shared.tenant_quotas is row-level secured and a
+        // missing row means "allow", so an unscoped check would pass everything.
+        if let Err(e) =
+            quota_store::check_write_quota(scope.conn(), *tid.as_uuid(), ciphertext.len()).await
+        {
+            return Err(VaultError::QuotaExceeded {
+                reason: e.to_string(),
+            });
+        }
+
+        let environment = custom_metadata
+            .get("environment")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(SecretEnvironment::Int);
+        let tags: Vec<String> = custom_metadata
+            .get("tags")
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let (secret_id, version) = secret_store::upsert_secret_version(
+            scope.conn(),
+            &tid,
+            path,
+            &SecretEngine::KvV2,
+            &ciphertext,
+            &dek_id,
+            cas,
+            max_versions.unwrap_or(10),
+            // Treat the presence of a CAS version as requiring CAS on the row.
+            cas.is_some(),
+            &custom_metadata,
+            environment,
+            &tags,
+        )
+        .await?;
+
+        // Commit before emitting: the event announces a write that has landed,
+        // and emitting from inside the transaction would advertise one that
+        // could still roll back.
+        scope.commit().await?;
+
+        // Emit a replication event so cross-region agents can propagate this write.
+        // This is best-effort: failure to write the event does not fail the write.
+        if let Err(e) = self
+            .emit_replication_event(tenant_id, path, &ciphertext, &dek_id)
+            .await
+        {
+            warn!(
+                error = %e,
+                path,
+                "failed to emit replication event for secret upsert"
+            );
+        }
+
+        Ok((secret_id.to_string(), version))
+    }
+
+    /// Soft-delete specific versions in PostgreSQL.
+    ///
+    /// Requires fetching the stable `secret_id` first because the storage
+    /// layer operates on `SecretId`, not on `(tenant_id, path)` pairs.
+    ///
+    /// An empty `versions` slice means "delete the current live version" — see
+    /// [`resolve_soft_delete_targets`] for why that must be resolved here.
+    async fn soft_delete(
+        &self,
+        tenant_id: &str,
+        path: &str,
+        versions: &[u32],
+    ) -> Result<u32, VaultError> {
+        let tid = Self::parse_tenant_id(tenant_id)?;
+        let mut scope = self.pool.begin_tenant(&tid).await?;
+        let meta = secret_store::get_secret_metadata(scope.conn(), &tid, path).await?;
+
+        let targets = resolve_soft_delete_targets(versions, meta.current_version);
+        if targets.is_empty() {
+            return Ok(0);
+        }
+
+        let deleted = secret_store::soft_delete_versions(scope.conn(), &meta.id, &targets).await?;
+        scope.commit().await?;
+        Ok(deleted)
+    }
+
+    /// Permanently destroy specific versions in PostgreSQL.
+    ///
+    /// This operation is irreversible: the storage layer zeroes the ciphertext
+    /// column and sets `destroyed = true`.
+    ///
+    /// An empty `versions` slice means "destroy every version that is not
+    /// already destroyed" — see [`resolve_destroy_targets`].
+    async fn destroy(
+        &self,
+        tenant_id: &str,
+        path: &str,
+        versions: &[u32],
+    ) -> Result<u32, VaultError> {
+        let tid = Self::parse_tenant_id(tenant_id)?;
+        let mut scope = self.pool.begin_tenant(&tid).await?;
+        let meta = secret_store::get_secret_metadata(scope.conn(), &tid, path).await?;
+
+        // Only pay for the history query on the "destroy everything" path.
+        let targets = if versions.is_empty() {
+            let history = secret_store::list_version_history(scope.conn(), &tid, path).await?;
+            let live: Vec<u32> = history
+                .iter()
+                .filter(|v| !v.destroyed)
+                .map(|v| v.version)
+                .collect();
+            resolve_destroy_targets(versions, &live)
+        } else {
+            resolve_destroy_targets(versions, &[])
+        };
+
+        if targets.is_empty() {
+            return Ok(0);
+        }
+
+        let destroyed = secret_store::destroy_versions(scope.conn(), &meta.id, &targets).await?;
+        scope.commit().await?;
+        Ok(destroyed)
+    }
+
+    /// List secret paths matching a prefix for the given tenant.
+    ///
+    /// On failure (e.g. invalid tenant UUID, database error) an empty list is
+    /// returned rather than propagating the error, consistent with the
+    /// `KvStore` fallback behaviour for listing.
+    async fn list(&self, tenant_id: &str, prefix: &str) -> Vec<String> {
+        let tid = match Self::parse_tenant_id(tenant_id) {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+
+        let Ok(mut scope) = self.pool.begin_tenant(&tid).await else {
+            return Vec::new();
+        };
+        secret_store::list_secret_paths(scope.conn(), &tid, prefix)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Retrieve metadata for a secret path without loading any secret material.
+    ///
+    /// `versions` is populated with *stubs*: version number and lifecycle flags,
+    /// but empty `ciphertext`/`dek_id`. Two reasons it cannot simply be empty:
+    ///
+    ///  1. `SecretEntry::current_version_number()` derives the version by
+    ///     scanning this vec. An empty vec made `GET /v1/secret/metadata/*`
+    ///     report `current_version: 0` for every secret that exists.
+    ///  2. Callers use the lifecycle flags to reason about deleted/destroyed
+    ///     versions, which they cannot do from the count alone.
+    ///
+    /// The ciphertext is deliberately withheld — a metadata endpoint must not
+    /// carry secret material, and no caller of `get_metadata` reads it.
+    async fn get_metadata(&self, tenant_id: &str, path: &str) -> Result<SecretEntry, VaultError> {
+        let tid = Self::parse_tenant_id(tenant_id)?;
+        let mut scope = self.pool.begin_tenant(&tid).await?;
+        let meta = secret_store::get_secret_metadata(scope.conn(), &tid, path).await?;
+        let history = secret_store::list_version_history(scope.conn(), &tid, path).await?;
+        scope.commit().await?;
+
+        let mut versions: Vec<VersionEntry> = history
+            .into_iter()
+            .map(|v| VersionEntry {
+                version: v.version,
+                ciphertext: String::new(),
+                dek_id: String::new(),
+                created_at: v.created_at,
+                deleted_at: v.deleted_at,
+                destroyed: v.destroyed,
+                custom_metadata: HashMap::new(),
+            })
+            .collect();
+
+        // `current_version_number()` scans in reverse and takes the first live
+        // hit, so ascending order is part of the contract.
+        versions.sort_by_key(|v| v.version);
+
+        Ok(SecretEntry {
+            secret_id: meta.id.to_string(),
+            tenant_id: meta.tenant_id.to_string(),
+            path: meta.path,
+            max_versions: meta.max_versions,
+            cas_required: meta.cas_required,
+            created_at: meta.created_at,
+            updated_at: meta.updated_at,
+            versions,
+            environment: meta.environment.as_str().to_string(),
+            tags: meta.tags,
+            custom_metadata: meta.custom_metadata,
+        })
+    }
+
+    async fn initiate_rotation(
+        &self,
+        tenant_id: &str,
+        path: &str,
+        ciphertext: String,
+        dek_id: String,
+        initiated_by: &str,
+        webhook_url: Option<&str>,
+        timeout_secs: Option<i32>,
+    ) -> Result<(String, u32), VaultError> {
+        let tid = Self::parse_tenant_id(tenant_id)?;
+        let mut scope = self.pool.begin_tenant(&tid).await?;
+        let out = secret_store::initiate_rotation(
+            scope.conn(),
+            &tid,
+            path,
+            &ciphertext,
+            &dek_id,
+            initiated_by,
+            webhook_url,
+            timeout_secs,
+        )
+        .await?;
+        scope.commit().await?;
+        Ok(out)
+    }
+
+    async fn confirm_rotation(
+        &self,
+        tenant_id: &str,
+        rotation_id: &str,
+        confirmed_by: &str,
+    ) -> Result<(u32, u32, chrono::DateTime<chrono::Utc>), VaultError> {
+        let tid = Self::parse_tenant_id(tenant_id)?;
+        let mut scope = self.pool.begin_tenant(&tid).await?;
+        let out =
+            secret_store::confirm_rotation(scope.conn(), &tid, rotation_id, confirmed_by).await?;
+        scope.commit().await?;
+        Ok(out)
+    }
+
+    async fn rollback(
+        &self,
+        tenant_id: &str,
+        path: &str,
+        target_version: u32,
+        rolled_back_by: &str,
+    ) -> Result<u32, VaultError> {
+        let tid = Self::parse_tenant_id(tenant_id)?;
+        let mut scope = self.pool.begin_tenant(&tid).await?;
+        let out =
+            secret_store::rollback_secret(scope.conn(), &tid, path, target_version, rolled_back_by)
+                .await?;
+        scope.commit().await?;
+        Ok(out)
+    }
+
+    async fn list_versions(
+        &self,
+        tenant_id: &str,
+        path: &str,
+    ) -> Result<Vec<VersionMeta>, VaultError> {
+        let tid = Self::parse_tenant_id(tenant_id)?;
+        let mut scope = self.pool.begin_tenant(&tid).await?;
+        let metas = secret_store::list_version_history(scope.conn(), &tid, path).await?;
+        scope.commit().await?;
+        Ok(metas
+            .into_iter()
+            .map(|m| VersionMeta {
+                version: m.version,
+                status: m.status,
+                created_by: m.created_by,
+                created_at: m.created_at,
+                deleted_at: m.deleted_at,
+                deprecated_at: m.deprecated_at,
+                revoked_at: m.revoked_at,
+                destroyed: m.destroyed,
+            })
+            .collect())
+    }
+
+    async fn get_active_rotation(
+        &self,
+        tenant_id: &str,
+        path: &str,
+    ) -> Result<Option<RotationInfo>, VaultError> {
+        let tid = Self::parse_tenant_id(tenant_id)?;
+        let mut scope = self.pool.begin_tenant(&tid).await?;
+        let record = secret_store::get_active_rotation(scope.conn(), &tid, path).await?;
+        scope.commit().await?;
+        Ok(record.map(|r| RotationInfo {
+            rotation_id: r.rotation_id,
+            secret_id: r.secret_id,
+            path: r.path,
+            old_version: r.old_version,
+            new_version: r.new_version,
+            status: r.status,
+            initiated_by: r.initiated_by,
+            confirmed_by: r.confirmed_by,
+            created_at: r.created_at,
+            confirmed_at: r.confirmed_at,
+            grace_ends_at: r.grace_ends_at,
+            expires_at: r.expires_at,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These guard the empty-`versions` contract between the HTTP layer and SQL.
+    //
+    // The UI sends `{"versions": []}` to mean "delete this secret". The stored
+    // function filters with `version = ANY($2)`, which matches zero rows for an
+    // empty array — so an unresolved empty slice makes the delete a silent
+    // no-op that still answers 200. That shipped once; these tests exist so it
+    // cannot ship again without turning red.
+
+    #[test]
+    fn soft_delete_empty_versions_targets_current_version() {
+        assert_eq!(resolve_soft_delete_targets(&[], 7), vec![7]);
+    }
+
+    #[test]
+    fn soft_delete_empty_versions_never_yields_empty_for_a_live_secret() {
+        // The regression itself: an empty result here reaches SQL as `ANY('{}')`
+        // and deletes nothing while reporting success.
+        for current in 1..=5u32 {
+            assert!(
+                !resolve_soft_delete_targets(&[], current).is_empty(),
+                "empty targets for live version {current} would silently no-op",
+            );
+        }
+    }
+
+    #[test]
+    fn soft_delete_explicit_versions_pass_through_untouched() {
+        assert_eq!(resolve_soft_delete_targets(&[1, 3], 7), vec![1, 3]);
+    }
+
+    #[test]
+    fn soft_delete_explicit_versions_win_over_current() {
+        // An explicit request must never be silently widened to the current
+        // version.
+        assert_eq!(resolve_soft_delete_targets(&[2], 9), vec![2]);
+    }
+
+    #[test]
+    fn soft_delete_no_live_version_is_a_no_op() {
+        // current_version == 0 means metadata exists but nothing is live.
+        assert!(resolve_soft_delete_targets(&[], 0).is_empty());
+    }
+
+    #[test]
+    fn destroy_empty_versions_targets_every_live_version() {
+        assert_eq!(resolve_destroy_targets(&[], &[1, 2, 3]), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn destroy_explicit_versions_pass_through_untouched() {
+        assert_eq!(resolve_destroy_targets(&[2], &[1, 2, 3]), vec![2]);
+    }
+
+    #[test]
+    fn destroy_with_nothing_live_is_a_no_op() {
+        assert!(resolve_destroy_targets(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn resolvers_agree_with_in_memory_backend_semantics() {
+        // KvStore::soft_delete with `[]` targets the current version, and
+        // KvStore::destroy with `[]` targets all non-destroyed versions. The
+        // two backends diverging on this is what produced the original bug, so
+        // pin the contract explicitly rather than by convention.
+        assert_eq!(resolve_soft_delete_targets(&[], 4), vec![4]);
+        assert_eq!(resolve_destroy_targets(&[], &[1, 2, 4]), vec![1, 2, 4]);
+    }
+}

@@ -1,0 +1,25 @@
+# Argo CD project scoping the vyltzero regions.
+#
+# Kept separate from `default` so a mistake in a region's values cannot deploy
+# into an unrelated namespace: destinations are limited to the vyltzero
+# namespaces, and cluster-scoped resources are denied outright (the chart
+# creates none — every resource it renders is namespaced).
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: vyltzero
+  namespace: argocd
+spec:
+  description: vyltzero secret-management regions (active/active HA mesh)
+  sourceRepos:
+    - https://github.com/bwalia/vyltzero.git
+    - https://charts.bitnami.com/bitnami
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: vyltzero
+    - server: https://kubernetes.default.svc
+      namespace: vyltzero-*
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist:
+    - group: '*'
+      kind: '*'

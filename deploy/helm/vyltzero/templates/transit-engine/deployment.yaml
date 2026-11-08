@@ -1,0 +1,114 @@
+{{/*
+transit-engine/deployment.yaml
+The transit-engine provides encryption-as-a-service. It does NOT store
+plaintext secrets; it encrypts/decrypts caller-supplied data using named
+keys managed in crypto-service. No gRPC port is exposed; consumers interact
+via REST only.
+*/}}
+{{- if .Values.transitEngine.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vyltzero.componentFullname" (dict "component" "transit-engine" "context" $) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vyltzero.componentLabels" (dict "component" "transit-engine" "componentType" "core" "context" $) | nindent 4 }}
+  {{- with .Values.transitEngine.podAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.transitEngine.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "vyltzero.componentSelectorLabels" (dict "component" "transit-engine" "context" $) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "vyltzero.componentLabels" (dict "component" "transit-engine" "componentType" "core" "context" $) | nindent 8 }}
+      {{- if .Values.monitoring.enabled }}
+      annotations:
+        {{- toYaml .Values.monitoring.scrapeAnnotations | nindent 8 }}
+        prometheus.io/port: {{ .Values.transitEngine.httpPort | quote }}
+        {{- with .Values.transitEngine.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- else }}
+      {{- with .Values.transitEngine.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- end }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "vyltzero.serviceAccountName" . }}
+      {{- include "vyltzero.podSecurityContext" . | nindent 6 }}
+      containers:
+        - name: transit-engine
+          image: {{ include "vyltzero.image" (dict "image" .Values.transitEngine.image "context" $) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          {{- include "vyltzero.containerSecurityContext" . | nindent 10 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.transitEngine.httpPort }}
+              protocol: TCP
+          env:
+            - name: HTTP_PORT
+              value: {{ .Values.transitEngine.httpPort | quote }}
+            # gRPC endpoints the transit-engine depends on. The binary reads the
+            # *_ENDPOINT names (services/transit-engine/src/main.rs) and needs the
+            # http:// scheme; the prior *_ADDR names were ignored. (Crypto is
+            # performed in-process, so no crypto endpoint is required here.)
+            # Wraps transit key material before it reaches PostgreSQL. Shared
+            # with crypto-service on purpose — a fourth independent root secret
+            # would make key custody harder, not safer.
+            - name: VAULT_ROOT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vyltzero.rootKeySecretName" . }}
+                  key: {{ include "vyltzero.rootKeySecretKey" . }}
+                  optional: false
+            # Public keys for verifying per-tenant Ed25519 tokens. transit-engine
+            # now resolves identity from the caller's signed token rather than
+            # from X-Tenant-Id / X-Policies headers; without this it rejects
+            # every request with 401 "VAULT_JWKS_URL is not configured".
+            - name: VAULT_JWKS_URL
+              value: "http://{{ include "vyltzero.componentFullname" (dict "component" "identity-service" "context" $) }}:8082/v1/identity/.well-known/jwks.json"
+            - name: POLICY_ENGINE_ENDPOINT
+              value: {{ printf "http://%s:%s"
+                          (include "vyltzero.componentFullname" (dict "component" "policy-engine" "context" $))
+                          (.Values.policyEngine.grpcPort | toString) }}
+            - name: AUDIT_SERVICE_ENDPOINT
+              value: {{ printf "http://%s:%s"
+                          (include "vyltzero.componentFullname" (dict "component" "audit-service" "context" $))
+                          (.Values.auditService.grpcPort | toString) }}
+            {{- with .Values.transitEngine.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.transitEngine.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- include "vyltzero.podScheduling" (dict "service" .Values.transitEngine "context" $) | nindent 6 }}
+{{- end }}

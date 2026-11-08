@@ -1,0 +1,622 @@
+//! Secret and secret version CRUD operations.
+//!
+//! These take a `&mut PgConnection` rather than a `&DbPool` so that every call
+//! runs inside a caller-opened [`crate::tenant_scope::ScopedTx`]. The scope
+//! sets `app.current_tenant_id`, which is what the row-level security policies
+//! on `shared.secrets` and `shared.secret_versions` resolve against.
+//!
+//! Taking a pool would have made that impossible to guarantee: each query would
+//! borrow an arbitrary pooled connection, so the session variable set for one
+//! statement need not apply to the next. Requiring a connection means the
+//! tenant scope and the query cannot come apart.
+
+use std::collections::HashMap;
+
+use sqlx::{PgConnection, Row};
+use uuid::Uuid;
+
+use vyltzero_core::types::secret::{
+    RotationPolicy, RotationRecord, SecretEngine, SecretEnvironment, SecretMetadata, SecretType,
+    SecretVersion, VersionStatus,
+};
+use vyltzero_core::types::tenant::TenantId;
+use vyltzero_core::VaultError;
+
+fn parse_engine(s: &str) -> SecretEngine {
+    match s {
+        "transit" => SecretEngine::Transit,
+        "dynamic_database" => SecretEngine::DynamicDatabase,
+        "ssh" => SecretEngine::Ssh,
+        "pki" => SecretEngine::Pki,
+        "cloud_aws" => SecretEngine::CloudAws,
+        "cloud_gcp" => SecretEngine::CloudGcp,
+        "cloud_azure" => SecretEngine::CloudAzure,
+        _ => SecretEngine::KvV2,
+    }
+}
+
+fn engine_str(e: &SecretEngine) -> &'static str {
+    match e {
+        SecretEngine::KvV2 => "kv_v2",
+        SecretEngine::Transit => "transit",
+        SecretEngine::DynamicDatabase => "dynamic_database",
+        SecretEngine::Ssh => "ssh",
+        SecretEngine::Pki => "pki",
+        SecretEngine::CloudAws => "cloud_aws",
+        SecretEngine::CloudGcp => "cloud_gcp",
+        SecretEngine::CloudAzure => "cloud_azure",
+    }
+}
+
+/// Retrieve secret metadata by tenant + path.
+pub async fn get_secret_metadata(
+    conn: &mut PgConnection,
+    tenant_id: &TenantId,
+    path: &str,
+) -> Result<SecretMetadata, VaultError> {
+    let row = sqlx::query(
+        "SELECT id, tenant_id, path, engine, current_version, max_versions, cas_required,
+                custom_metadata, created_at, updated_at,
+                COALESCE(environment, 'INT') AS environment,
+                COALESCE(tags, '{}') AS tags,
+                COALESCE(secret_type, 'STALE_TTL') AS secret_type,
+                ttl_seconds, soft_warn_seconds, rotation_interval_seconds,
+                grace_period_seconds, webhook_url,
+                expires_at, last_rotated_at, next_rotation_at,
+                COALESCE(rotation_status, 'none') AS rotation_status
+         FROM shared.secrets
+         WHERE tenant_id = $1 AND path = $2",
+    )
+    .bind(tenant_id.as_uuid())
+    .bind(path)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| VaultError::Database {
+        reason: e.to_string(),
+    })?
+    .ok_or_else(|| VaultError::SecretNotFound {
+        path: path.to_string(),
+        version: None,
+    })?;
+
+    let custom_metadata: serde_json::Value = row.get("custom_metadata");
+    let custom_map: HashMap<String, String> =
+        serde_json::from_value(custom_metadata).unwrap_or_default();
+
+    let environment: SecretEnvironment = row
+        .get::<String, _>("environment")
+        .parse()
+        .unwrap_or_default();
+    let tags: Vec<String> = row.get("tags");
+
+    let secret_type: SecretType = row
+        .get::<Option<&str>, _>("secret_type")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default();
+
+    let rotation_policy = RotationPolicy {
+        ttl_seconds: row.get::<Option<i32>, _>("ttl_seconds").map(|v| v as i64),
+        soft_warn_seconds: row
+            .get::<Option<i32>, _>("soft_warn_seconds")
+            .map(|v| v as i64),
+        rotation_interval_seconds: row
+            .get::<Option<i32>, _>("rotation_interval_seconds")
+            .map(|v| v as i64),
+        grace_period_seconds: row
+            .get::<Option<i32>, _>("grace_period_seconds")
+            .map(|v| v as i64),
+        webhook_url: row.get("webhook_url"),
+    };
+
+    Ok(SecretMetadata {
+        id: vyltzero_core::SecretId(row.get::<Uuid, _>("id")),
+        tenant_id: TenantId(row.get::<Uuid, _>("tenant_id")),
+        path: row.get("path"),
+        engine: parse_engine(row.get("engine")),
+        current_version: row.get::<i32, _>("current_version") as u32,
+        max_versions: row.get::<i32, _>("max_versions") as u32,
+        cas_required: row.get("cas_required"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        custom_metadata: custom_map,
+        environment,
+        tags,
+        secret_type,
+        rotation_policy,
+        expires_at: row.get("expires_at"),
+        last_rotated_at: row.get("last_rotated_at"),
+        next_rotation_at: row.get("next_rotation_at"),
+        rotation_status: row
+            .get::<Option<&str>, _>("rotation_status")
+            .unwrap_or("none")
+            .to_string(),
+    })
+}
+
+/// Retrieve a specific version of a secret.
+/// Highest version of a secret that is neither soft-deleted nor destroyed.
+/// Returns 0 when no live version remains.
+///
+/// This exists because `shared.secrets.current_version` is a *write* pointer:
+/// `vault_upsert_secret` advances it, but `vault_soft_delete_versions` does not
+/// move it back. After deleting the current version the column still names that
+/// version, so a reader that trusts it serves data the caller just deleted.
+/// This is the SQL equivalent of `SecretEntry::current_version_number()` in the
+/// in-memory backend, and the two must agree.
+pub async fn latest_live_version(
+    conn: &mut PgConnection,
+    secret_id: &vyltzero_core::SecretId,
+) -> Result<u32, VaultError> {
+    let row = sqlx::query(
+        "SELECT COALESCE(MAX(version), 0) AS version
+         FROM shared.secret_versions
+         WHERE secret_id = $1
+           AND deleted_at IS NULL
+           AND destroyed = false",
+    )
+    .bind(secret_id.0)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| VaultError::Database {
+        reason: e.to_string(),
+    })?;
+
+    Ok(row.get::<i32, _>("version") as u32)
+}
+
+pub async fn get_secret_version(
+    conn: &mut PgConnection,
+    secret_id: &vyltzero_core::SecretId,
+    version: u32,
+) -> Result<SecretVersion, VaultError> {
+    let row = sqlx::query(
+        "SELECT version, ciphertext, dek_id, custom_metadata, created_at, deleted_at, destroyed,
+                COALESCE(status, 'active') AS status,
+                created_by, deprecated_at, revoked_at
+         FROM shared.secret_versions
+         WHERE secret_id = $1 AND version = $2",
+    )
+    .bind(secret_id.0)
+    .bind(version as i32)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| VaultError::Database {
+        reason: e.to_string(),
+    })?
+    .ok_or_else(|| VaultError::SecretNotFound {
+        path: String::new(),
+        version: Some(version),
+    })?;
+
+    let destroyed: bool = row.get("destroyed");
+    if destroyed {
+        return Err(VaultError::VersionDestroyed { version });
+    }
+
+    let custom_metadata: serde_json::Value = row.get("custom_metadata");
+    let custom_map: HashMap<String, String> =
+        serde_json::from_value(custom_metadata).unwrap_or_default();
+
+    let status: VersionStatus = row
+        .get::<Option<&str>, _>("status")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default();
+
+    Ok(SecretVersion {
+        version: row.get::<i32, _>("version") as u32,
+        ciphertext: row.get("ciphertext"),
+        dek_id: row.get("dek_id"),
+        custom_metadata: custom_map,
+        created_at: row.get("created_at"),
+        deleted_at: row.get("deleted_at"),
+        destroyed,
+        status,
+        created_by: row.get("created_by"),
+        deprecated_at: row.get("deprecated_at"),
+        revoked_at: row.get("revoked_at"),
+    })
+}
+
+/// A listed secret path with environment and tags (no ciphertext).
+#[derive(Debug, Clone)]
+pub struct ListedSecret {
+    pub path: String,
+    pub environment: SecretEnvironment,
+    pub tags: Vec<String>,
+}
+
+/// List secret paths under a prefix for a given tenant.
+pub async fn list_secret_paths(
+    conn: &mut PgConnection,
+    tenant_id: &TenantId,
+    prefix: &str,
+) -> Result<Vec<String>, VaultError> {
+    let items = list_secrets(conn, tenant_id, prefix, None, None).await?;
+    Ok(items.into_iter().map(|i| i.path).collect())
+}
+
+/// List secrets under a prefix, optionally filtered by environment and/or tag.
+///
+/// Filters use AND semantics. `tag` matches if it appears in the secret's tags
+/// array (`tag = ANY(tags)`).
+pub async fn list_secrets(
+    conn: &mut PgConnection,
+    tenant_id: &TenantId,
+    prefix: &str,
+    environment: Option<&str>,
+    tag: Option<&str>,
+) -> Result<Vec<ListedSecret>, VaultError> {
+    let pattern = format!("{}%", prefix);
+    let rows = sqlx::query(
+        "SELECT path,
+                COALESCE(environment, 'INT') AS environment,
+                COALESCE(tags, '{}') AS tags
+         FROM shared.secrets
+         WHERE tenant_id = $1
+           AND path LIKE $2
+           AND ($3::text IS NULL OR environment = $3)
+           AND ($4::text IS NULL OR $4 = ANY(tags))
+         ORDER BY path",
+    )
+    .bind(tenant_id.as_uuid())
+    .bind(&pattern)
+    .bind(environment)
+    .bind(tag)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| VaultError::Database {
+        reason: e.to_string(),
+    })?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let env_s: String = r.get("environment");
+            ListedSecret {
+                path: r.get("path"),
+                environment: env_s.parse().unwrap_or_default(),
+                tags: r.get("tags"),
+            }
+        })
+        .collect())
+}
+
+/// Write a new secret version using the atomic upsert function.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_secret_version(
+    conn: &mut PgConnection,
+    tenant_id: &TenantId,
+    path: &str,
+    engine: &SecretEngine,
+    ciphertext: &str,
+    dek_id: &str,
+    cas_version: Option<u32>,
+    max_versions: u32,
+    cas_required: bool,
+    custom_metadata: &HashMap<String, String>,
+    environment: SecretEnvironment,
+    tags: &[String],
+) -> Result<(vyltzero_core::SecretId, u32), VaultError> {
+    let meta_json = serde_json::to_value(custom_metadata).unwrap_or_else(|_| serde_json::json!({}));
+    let row =
+        sqlx::query("SELECT * FROM shared.vault_upsert_secret($1, $2, $3, $4, $5, $6, $7, $8, $9)")
+            .bind(tenant_id.as_uuid())
+            .bind(path)
+            .bind(engine_str(engine))
+            .bind(ciphertext)
+            .bind(dek_id)
+            .bind(cas_version.map(|v| v as i32))
+            .bind(max_versions as i32)
+            .bind(cas_required)
+            .bind(&meta_json)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("CAS conflict") {
+                    VaultError::CasConflict {
+                        expected: cas_version.unwrap_or(0),
+                        actual: 0,
+                    }
+                } else {
+                    VaultError::Database { reason: msg }
+                }
+            })?;
+
+    let secret_id = vyltzero_core::SecretId(row.get::<Uuid, _>("secret_id"));
+    let new_version = row.get::<i32, _>("new_version") as u32;
+
+    // Persist first-class labels and keep the secrets-row custom_metadata in
+    // sync (vault_upsert_secret only writes it on INSERT, not on conflict).
+    sqlx::query(
+        "UPDATE shared.secrets
+         SET environment = $3,
+             tags = $4,
+             custom_metadata = $5,
+             updated_at = now()
+         WHERE tenant_id = $1 AND path = $2",
+    )
+    .bind(tenant_id.as_uuid())
+    .bind(path)
+    .bind(environment.as_str())
+    .bind(tags)
+    .bind(&meta_json)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| VaultError::Database {
+        reason: e.to_string(),
+    })?;
+
+    Ok((secret_id, new_version))
+}
+
+/// Soft-delete secret versions.
+pub async fn soft_delete_versions(
+    conn: &mut PgConnection,
+    secret_id: &vyltzero_core::SecretId,
+    versions: &[u32],
+) -> Result<u32, VaultError> {
+    let versions_i32: Vec<i32> = versions.iter().map(|v| *v as i32).collect();
+    let row = sqlx::query("SELECT shared.vault_soft_delete_versions($1, $2) AS count")
+        .bind(secret_id.0)
+        .bind(&versions_i32)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| VaultError::Database {
+            reason: e.to_string(),
+        })?;
+
+    Ok(row.get::<i32, _>("count") as u32)
+}
+
+/// Permanently destroy secret versions (irreversible).
+pub async fn destroy_versions(
+    conn: &mut PgConnection,
+    secret_id: &vyltzero_core::SecretId,
+    versions: &[u32],
+) -> Result<u32, VaultError> {
+    let versions_i32: Vec<i32> = versions.iter().map(|v| *v as i32).collect();
+    let row = sqlx::query("SELECT shared.vault_destroy_versions($1, $2) AS count")
+        .bind(secret_id.0)
+        .bind(&versions_i32)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| VaultError::Database {
+            reason: e.to_string(),
+        })?;
+
+    Ok(row.get::<i32, _>("count") as u32)
+}
+
+/// Initiate a two-phase rotation for a secret. Returns (rotation_id, new_version).
+pub async fn initiate_rotation(
+    conn: &mut PgConnection,
+    tenant_id: &TenantId,
+    path: &str,
+    ciphertext: &str,
+    dek_id: &str,
+    initiated_by: &str,
+    webhook_url: Option<&str>,
+    timeout_secs: Option<i32>,
+) -> Result<(String, u32), VaultError> {
+    let row = sqlx::query(
+        "SELECT rotation_id, new_version
+         FROM shared.vault_initiate_rotation($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(tenant_id.as_uuid())
+    .bind(path)
+    .bind(ciphertext)
+    .bind(dek_id)
+    .bind(initiated_by)
+    .bind(webhook_url)
+    .bind(timeout_secs)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("rotation already pending") {
+            VaultError::InvalidOperation {
+                reason: format!("rotation already pending for secret: {path}"),
+            }
+        } else if msg.contains("secret not found") {
+            VaultError::SecretNotFound {
+                path: path.to_string(),
+                version: None,
+            }
+        } else {
+            VaultError::Database { reason: msg }
+        }
+    })?;
+
+    let rotation_id: uuid::Uuid = row.get("rotation_id");
+    let new_version = row.get::<i32, _>("new_version") as u32;
+    Ok((rotation_id.to_string(), new_version))
+}
+
+/// Confirm a pending rotation — activates the new version and deprecates the old.
+/// Returns (old_version, new_version, grace_ends_at).
+/// Confirm a pending rotation.
+///
+/// `tenant_id` is not decoration. `shared.vault_confirm_rotation` resolves the
+/// rotation by id alone (`010_secret_lifecycle.sql`), and the HTTP handler
+/// authorised the caller against their own tenant and then passed the bare
+/// rotation id through — so a caller holding any valid rotation UUID could
+/// confirm another tenant's rotation. The ownership check below closes that
+/// directly, rather than waiting for row-level security to be enforced; when it
+/// is, the RLS policy on `shared.secret_rotations` becomes a second barrier
+/// behind this one.
+pub async fn confirm_rotation(
+    conn: &mut PgConnection,
+    tenant_id: &TenantId,
+    rotation_id: &str,
+    confirmed_by: &str,
+) -> Result<(u32, u32, chrono::DateTime<chrono::Utc>), VaultError> {
+    let rid: uuid::Uuid = rotation_id
+        .parse()
+        .map_err(|_| VaultError::InvalidOperation {
+            reason: format!("invalid rotation_id: {rotation_id}"),
+        })?;
+
+    // Deliberately reports "not found" rather than "forbidden" for a rotation
+    // belonging to someone else: the caller learning that a given UUID exists
+    // under another tenant is itself a cross-tenant disclosure.
+    let owner: Option<(uuid::Uuid,)> =
+        sqlx::query_as("SELECT tenant_id FROM shared.secret_rotations WHERE id = $1")
+            .bind(rid)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| VaultError::Database {
+                reason: e.to_string(),
+            })?;
+
+    match owner {
+        Some((owner_tenant,)) if owner_tenant == *tenant_id.as_uuid() => {}
+        _ => {
+            return Err(VaultError::InvalidOperation {
+                reason: format!("rotation {rotation_id} not found or expired"),
+            })
+        }
+    }
+
+    let row = sqlx::query(
+        "SELECT old_version, new_version, grace_ends_at
+         FROM shared.vault_confirm_rotation($1, $2)",
+    )
+    .bind(rid)
+    .bind(confirmed_by)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("not found or expired") {
+            VaultError::InvalidOperation {
+                reason: format!("rotation {rotation_id} not found or expired"),
+            }
+        } else {
+            VaultError::Database { reason: msg }
+        }
+    })?;
+
+    let old_version = row.get::<i32, _>("old_version") as u32;
+    let new_version = row.get::<i32, _>("new_version") as u32;
+    let grace_ends_at: chrono::DateTime<chrono::Utc> = row.get("grace_ends_at");
+    Ok((old_version, new_version, grace_ends_at))
+}
+
+/// Rollback to a previous version (creates a new version row with the same ciphertext).
+pub async fn rollback_secret(
+    conn: &mut PgConnection,
+    tenant_id: &TenantId,
+    path: &str,
+    target_version: u32,
+    rolled_back_by: &str,
+) -> Result<u32, VaultError> {
+    let row = sqlx::query("SELECT new_version FROM shared.vault_rollback_secret($1, $2, $3, $4)")
+        .bind(tenant_id.as_uuid())
+        .bind(path)
+        .bind(target_version as i32)
+        .bind(rolled_back_by)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("secret not found") {
+                VaultError::SecretNotFound {
+                    path: path.to_string(),
+                    version: None,
+                }
+            } else if msg.contains("not found or destroyed") {
+                VaultError::SecretNotFound {
+                    path: path.to_string(),
+                    version: Some(target_version),
+                }
+            } else {
+                VaultError::Database { reason: msg }
+            }
+        })?;
+
+    Ok(row.get::<i32, _>("new_version") as u32)
+}
+
+/// List all versions with lifecycle metadata for a secret (no ciphertext).
+pub async fn list_version_history(
+    conn: &mut PgConnection,
+    tenant_id: &TenantId,
+    path: &str,
+) -> Result<Vec<vyltzero_core::types::secret::VersionMeta>, VaultError> {
+    let rows = sqlx::query(
+        "SELECT version, status, created_by, created_at,
+                deleted_at, deprecated_at, revoked_at, destroyed
+         FROM shared.vault_list_version_history($1, $2)",
+    )
+    .bind(tenant_id.as_uuid())
+    .bind(path)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| VaultError::Database {
+        reason: e.to_string(),
+    })?;
+
+    let versions = rows
+        .into_iter()
+        .map(|r| {
+            let status: VersionStatus = r
+                .get::<Option<&str>, _>("status")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default();
+            vyltzero_core::types::secret::VersionMeta {
+                version: r.get::<i32, _>("version") as u32,
+                status,
+                created_by: r.get("created_by"),
+                created_at: r.get("created_at"),
+                deleted_at: r.get("deleted_at"),
+                deprecated_at: r.get("deprecated_at"),
+                revoked_at: r.get("revoked_at"),
+                destroyed: r.get("destroyed"),
+            }
+        })
+        .collect();
+
+    Ok(versions)
+}
+
+/// Retrieve the active (pending_activation) rotation record for a secret path.
+pub async fn get_active_rotation(
+    conn: &mut PgConnection,
+    tenant_id: &TenantId,
+    path: &str,
+) -> Result<Option<RotationRecord>, VaultError> {
+    let row = sqlx::query(
+        "SELECT r.id, r.secret_id, r.path, r.old_version, r.new_version,
+                r.status, r.initiated_by, r.confirmed_by,
+                r.created_at, r.confirmed_at, r.grace_ends_at, r.expires_at
+         FROM shared.secret_rotations r
+         JOIN shared.secrets s ON s.id = r.secret_id
+         WHERE s.tenant_id = $1 AND s.path = $2
+           AND r.status = 'pending_activation'
+         ORDER BY r.created_at DESC
+         LIMIT 1",
+    )
+    .bind(tenant_id.as_uuid())
+    .bind(path)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| VaultError::Database {
+        reason: e.to_string(),
+    })?;
+
+    Ok(row.map(|r| RotationRecord {
+        rotation_id: r.get::<uuid::Uuid, _>("id").to_string(),
+        secret_id: r.get::<uuid::Uuid, _>("secret_id").to_string(),
+        path: r.get("path"),
+        old_version: r.get::<i32, _>("old_version") as u32,
+        new_version: r.get::<i32, _>("new_version") as u32,
+        status: r.get::<&str, _>("status").to_string(),
+        initiated_by: r.get::<&str, _>("initiated_by").to_string(),
+        confirmed_by: r.get("confirmed_by"),
+        created_at: r.get("created_at"),
+        confirmed_at: r.get("confirmed_at"),
+        grace_ends_at: r.get("grace_ends_at"),
+        expires_at: r.get("expires_at"),
+    }))
+}

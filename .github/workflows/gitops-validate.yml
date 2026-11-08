@@ -1,0 +1,394 @@
+name: GitOps
+
+# Guards the two-region mesh. Every check here catches a class of failure that
+# is silent at deploy time and expensive to debug in a live region:
+#   - a chart that renders for one region but not another
+#   - peer rosters that disagree, so replication runs one way only
+#   - regions reading different key material, so replicated ciphertext never
+#     decrypts in the receiving region
+#   - the chart's vendored migrations drifting from storage/postgres/init
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'deploy/helm/**'
+      - 'deploy/gitops/**'
+      - 'storage/postgres/init/**'
+      - 'scripts/validate-gitops.sh'
+      - '.github/workflows/gitops-validate.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'deploy/helm/**'
+      - 'deploy/gitops/**'
+      - 'storage/postgres/init/**'
+      - 'scripts/validate-gitops.sh'
+      - '.github/workflows/gitops-validate.yml'
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Validate region mesh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Install kubeconform
+        run: |
+          curl -sSfL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+            | tar -xz -C /usr/local/bin kubeconform
+          kubeconform -v
+
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet pyyaml
+
+      # NOT `helm dependency build`: the postgresql subchart is vendored at
+      # deploy/helm/vyltzero/charts/*.tgz and committed alongside Chart.lock, so
+      # the dependency is already satisfied. Running the build asks a fresh
+      # runner to resolve the Bitnami repo it has never added, which fails with
+      # "no repository definition for https://charts.bitnami.com/bitnami" — and
+      # it would put a network dependency on the one repo that has been
+      # unreliable for this chart (hence the bitnamilegacy image pin).
+      - name: Verify the vendored subchart is present
+        run: |
+          if ! ls deploy/helm/vyltzero/charts/postgresql-*.tgz >/dev/null 2>&1; then
+            echo "::error::vendored postgresql subchart missing from deploy/helm/vyltzero/charts/"
+            echo "regenerate with: helm repo add bitnami https://charts.bitnami.com/bitnami && helm dependency build deploy/helm/vyltzero"
+            exit 1
+          fi
+          ls -1 deploy/helm/vyltzero/charts/*.tgz
+
+      - name: Validate region mesh
+        run: ./scripts/validate-gitops.sh
+
+  migrations:
+    name: Schema migrations apply cleanly
+    runs-on: ubuntu-latest
+    # The migration Job is the difference between a second region that comes up
+    # and one that crash-loops on missing tables, so it is exercised against a
+    # real PostgreSQL rather than only rendered.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: vyltzero
+          POSTGRES_USER: vyltzero
+          POSTGRES_PASSWORD: testpassword
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Install tooling
+        run: |
+          python3 -m pip install --quiet pyyaml
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+
+      # NOT `helm dependency build`: the postgresql subchart is vendored at
+      # deploy/helm/vyltzero/charts/*.tgz and committed alongside Chart.lock, so
+      # the dependency is already satisfied. Running the build asks a fresh
+      # runner to resolve the Bitnami repo it has never added, which fails with
+      # "no repository definition for https://charts.bitnami.com/bitnami" — and
+      # it would put a network dependency on the one repo that has been
+      # unreliable for this chart (hence the bitnamilegacy image pin).
+      - name: Verify the vendored subchart is present
+        run: |
+          if ! ls deploy/helm/vyltzero/charts/postgresql-*.tgz >/dev/null 2>&1; then
+            echo "::error::vendored postgresql subchart missing from deploy/helm/vyltzero/charts/"
+            echo "regenerate with: helm repo add bitnami https://charts.bitnami.com/bitnami && helm dependency build deploy/helm/vyltzero"
+            exit 1
+          fi
+          ls -1 deploy/helm/vyltzero/charts/*.tgz
+
+      - name: Extract the rendered migration bundle
+        run: |
+          helm template vyltzero deploy/helm/vyltzero -n vyltzero-ci \
+            -f deploy/gitops/regions/region-b.values.yaml > /tmp/rendered.yaml
+          mkdir -p /tmp/migrations
+          python3 - <<'PY'
+          import yaml, pathlib
+          docs = [d for d in yaml.safe_load_all(open("/tmp/rendered.yaml"))
+                  if d and d.get("kind") == "ConfigMap" and "migrations" in d["metadata"]["name"]]
+          assert len(docs) == 1, f"expected exactly one migrations ConfigMap, found {len(docs)}"
+          out = pathlib.Path("/tmp/migrations")
+          for name, body in docs[0]["data"].items():
+              (out / name).write_text(body)
+          print(f"extracted {len(docs[0]['data'])} files")
+          PY
+
+      - name: Apply to an empty database
+        env:
+          PGHOST: localhost
+          PGPORT: '5432'
+          PGUSER: vyltzero
+          PGDATABASE: vyltzero
+          PGPASSWORD: testpassword
+          BASELINE_ON_EXISTING: 'true'
+          SQL_DIR: /tmp/migrations
+        run: sh /tmp/migrations/migrate.sh
+
+      - name: Re-run is a no-op
+        env:
+          PGHOST: localhost
+          PGPORT: '5432'
+          PGUSER: vyltzero
+          PGDATABASE: vyltzero
+          PGPASSWORD: testpassword
+          BASELINE_ON_EXISTING: 'true'
+          SQL_DIR: /tmp/migrations
+        run: |
+          sh /tmp/migrations/migrate.sh | tee /tmp/rerun.log
+          if grep -q '    apply ' /tmp/rerun.log; then
+            echo "::error::second run re-applied a migration; the ledger is not working"
+            exit 1
+          fi
+
+      - name: Region registry is seeded
+        env: { PGPASSWORD: testpassword }
+        run: |
+          rows=$(psql -h localhost -U vyltzero -d vyltzero -tAc \
+            "SELECT count(*) FROM system.regions")
+          echo "system.regions rows: $rows"
+          # Every region in the roster must be present: the local one plus its peers.
+          if [ "$rows" -lt 2 ]; then
+            echo "::error::expected the local region and its peers in system.regions"
+            exit 1
+          fi
+          psql -h localhost -U vyltzero -d vyltzero -c \
+            "SELECT id, endpoint, is_local FROM system.regions ORDER BY id"
+
+      # The point of the RLS work is that isolation is enforced by the database,
+      # not only by every query remembering its WHERE clause. That claim is only
+      # worth anything if something checks it, so this asserts the property
+      # directly rather than asserting that the DDL ran.
+      - name: Tenant isolation is enforced, not just declared
+        env: { PGPASSWORD: testpassword }
+        run: |
+          set -eu
+
+          echo "--- every tenant-scoped table carries a policy"
+          psql -h localhost -U vyltzero -d vyltzero -v ON_ERROR_STOP=1 \
+            -c "SELECT * FROM shared.rls_status()"
+          uncovered=$(psql -h localhost -U vyltzero -d vyltzero -tAq \
+            -c "SELECT count(*) FROM shared.rls_status() WHERE policy_count = 0 OR NOT rls_enabled")
+          if [ "$uncovered" != "0" ]; then
+            echo "::error::$uncovered tenant-scoped table(s) have no row-level security"
+            psql -h localhost -U vyltzero -d vyltzero \
+              -c "SELECT tbl FROM shared.rls_status() WHERE policy_count = 0 OR NOT rls_enabled"
+            exit 1
+          fi
+
+          # NOTE: `vyltzero` is a SUPERUSER in this container, because the
+          # postgres image makes POSTGRES_USER one. In the live regions it is
+          # not — verified there as rolsuper=f, rolbypassrls=f, merely the table
+          # owner. Under either attribute set RLS does not constrain it, which is
+          # exactly why every assertion below runs as the separate vyltzero_app
+          # role instead. Asserting against the owner would pass while proving
+          # nothing.
+          echo "--- create the least-privilege role the services connect as"
+          psql -h localhost -U vyltzero -d vyltzero -v ON_ERROR_STOP=1 \
+            -v app_password=citest -f deploy/helm/vyltzero/files/bootstrap/rls_app_role.sql
+          psql -h localhost -U vyltzero -d vyltzero -v ON_ERROR_STOP=1 -q \
+            -f /tmp/migrations/029_rls_enforce.sql
+
+          echo "--- seed two tenants"
+          psql -h localhost -U vyltzero -d vyltzero -v ON_ERROR_STOP=1 -q -f - <<'SEED'
+          INSERT INTO system.tenants (id, slug, display_name, tier, root_key_id) VALUES
+            ('11111111-1111-1111-1111-111111111111','acme','Acme','shared','rk1'),
+            ('22222222-2222-2222-2222-222222222222','globex','Globex','shared','rk2')
+          ON CONFLICT DO NOTHING;
+          INSERT INTO shared.secrets (id, tenant_id, path, engine) VALUES
+            ('aaaaaaaa-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','prod/db','kv_v2'),
+            ('bbbbbbbb-0000-0000-0000-000000000002','22222222-2222-2222-2222-222222222222','prod/db','kv_v2')
+          ON CONFLICT DO NOTHING;
+          INSERT INTO shared.secret_versions (secret_id, version, ciphertext, dek_id) VALUES
+            ('aaaaaaaa-0000-0000-0000-000000000001',1,'ACME','dek-a'),
+            ('bbbbbbbb-0000-0000-0000-000000000002',1,'GLOBEX','dek-b')
+          ON CONFLICT DO NOTHING;
+          INSERT INTO shared.api_keys
+            (id, tenant_id, name, key_hash, key_prefix, path_prefixes, policies, created_by) VALUES
+            ('dddddddd-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111',
+             'acme-key', '\\x01'::bytea, 'acme', '{}', '{default}', 'ci'),
+            ('eeeeeeee-0000-0000-0000-000000000002','22222222-2222-2222-2222-222222222222',
+             'globex-key', '\\x02'::bytea, 'glbx', '{}', '{default}', 'ci')
+          ON CONFLICT DO NOTHING;
+          INSERT INTO shared.mfa_totp (api_key_id, tenant_id, wrapped_secret, confirmed_at) VALUES
+            ('dddddddd-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','ACME-SECRET', now()),
+            ('eeeeeeee-0000-0000-0000-000000000002','22222222-2222-2222-2222-222222222222','GLOBEX-SECRET', now())
+          ON CONFLICT DO NOTHING;
+          INSERT INTO shared.mfa_recovery_codes (api_key_id, tenant_id, code_hash) VALUES
+            ('dddddddd-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','acme-hash'),
+            ('eeeeeeee-0000-0000-0000-000000000002','22222222-2222-2222-2222-222222222222','globex-hash')
+          ON CONFLICT DO NOTHING;
+          SEED
+
+          # -tAq -f - : tuples only, unaligned, quiet. Without -q the BEGIN/SET/
+          # COMMIT command tags land in stdout and every assertion below compares
+          # against "COMMIT" instead of the value it meant to check.
+          #
+          # ON_ERROR_STOP is what makes the write assertion meaningful: psql
+          # exits 0 after a failed statement unless it is set, so the
+          # "must be rejected" check below passed whether or not the policy
+          # actually rejected anything.
+          app() {
+            PGPASSWORD=citest psql -h localhost -U vyltzero_app -d vyltzero \
+              -tAq -v ON_ERROR_STOP=1 -f -
+          }
+
+          echo "--- an unscoped session must see nothing (fail closed)"
+          n=$(printf 'SELECT count(*) FROM shared.secrets;\n' | app)
+          [ "$n" = "0" ] || { echo "::error::unscoped session saw $n secrets; RLS is not failing closed"; exit 1; }
+
+          echo "--- a scoped session sees only its own tenant"
+          n=$(app <<'Q'
+          BEGIN;
+          SET LOCAL app.current_tenant_id = '11111111-1111-1111-1111-111111111111';
+          SELECT count(*) FROM shared.secrets;
+          COMMIT;
+          Q
+          )
+          [ "$n" = "1" ] || { echo "::error::Acme saw $n secrets, expected exactly its own"; exit 1; }
+
+          echo "--- and cannot read the other tenant's ciphertext"
+          c=$(app <<'Q'
+          BEGIN;
+          SET LOCAL app.current_tenant_id = '11111111-1111-1111-1111-111111111111';
+          SELECT string_agg(ciphertext, ',' ORDER BY ciphertext) FROM shared.secret_versions;
+          COMMIT;
+          Q
+          )
+          [ "$c" = "ACME" ] || { echo "::error::cross-tenant ciphertext visible: got '$c', expected 'ACME'"; exit 1; }
+
+          echo "--- and cannot write a row attributed to the other tenant"
+          if app <<'Q' 2>/dev/null
+          BEGIN;
+          SET LOCAL app.current_tenant_id = '11111111-1111-1111-1111-111111111111';
+          INSERT INTO shared.secrets (id, tenant_id, path, engine)
+          VALUES ('cccccccc-0000-0000-0000-000000000003','22222222-2222-2222-2222-222222222222','stolen','kv_v2');
+          COMMIT;
+          Q
+          then
+            echo "::error::a tenant inserted a secret attributed to another tenant"
+            exit 1
+          fi
+
+          echo "--- the cross-tenant escape hatch still works for the sweeps"
+          n=$(app <<'Q'
+          BEGIN;
+          SET LOCAL app.bypass_rls = 'true';
+          SELECT count(*) FROM shared.secrets;
+          COMMIT;
+          Q
+          )
+          [ "$n" = "2" ] || { echo "::error::bypass scope saw $n secrets, expected 2"; exit 1; }
+
+          echo "--- api_keys: an unscoped session must see no credentials"
+          n=$(printf 'SELECT count(*) FROM shared.api_keys;\n' | app)
+          [ "$n" = "0" ] || { echo "::error::unscoped session saw $n api keys; RLS is not failing closed"; exit 1; }
+
+          echo "--- api_keys: a tenant sees only its own"
+          n=$(app <<'Q'
+          BEGIN;
+          SET LOCAL app.current_tenant_id = '11111111-1111-1111-1111-111111111111';
+          SELECT string_agg(name, ',' ORDER BY name) FROM shared.api_keys;
+          COMMIT;
+          Q
+          )
+          [ "$n" = "acme-key" ] || { echo "::error::cross-tenant api keys visible: got '$n', expected 'acme-key'"; exit 1; }
+
+          echo "--- api_keys: authentication by key_hash is the cross-tenant path"
+          # find_by_hash cannot be tenant-scoped — the lookup is what determines
+          # the tenant. It runs under the bypass, so assert the bypass reaches
+          # both tenants; if this ever fails, every login fails.
+          n=$(app <<'Q'
+          BEGIN;
+          SET LOCAL app.bypass_rls = 'true';
+          SELECT count(*) FROM shared.api_keys;
+          COMMIT;
+          Q
+          )
+          [ "$n" = "2" ] || { echo "::error::the authentication bypass saw $n keys, expected 2 — logins would fail"; exit 1; }
+
+          echo "--- api_keys: a tenant cannot revoke another tenant's key"
+          n=$(app <<'Q'
+          BEGIN;
+          SET LOCAL app.current_tenant_id = '11111111-1111-1111-1111-111111111111';
+          UPDATE shared.api_keys SET revoked_at = now()
+           WHERE id = 'eeeeeeee-0000-0000-0000-000000000002';
+          SELECT count(*) FROM shared.api_keys WHERE revoked_at IS NOT NULL;
+          COMMIT;
+          Q
+          )
+          [ "$n" = "0" ] || { echo "::error::a tenant revoked another tenant's api key"; exit 1; }
+
+          echo "--- mfa: an unscoped session sees no TOTP secrets"
+          n=$(printf 'SELECT count(*) FROM shared.mfa_totp;\n' | app)
+          [ "$n" = "0" ] || { echo "::error::unscoped session saw $n TOTP enrolments"; exit 1; }
+
+          echo "--- mfa: a tenant sees only its own second factor"
+          n=$(app <<'Q'
+          BEGIN;
+          SET LOCAL app.current_tenant_id = '11111111-1111-1111-1111-111111111111';
+          SELECT string_agg(wrapped_secret, ',') FROM shared.mfa_totp;
+          COMMIT;
+          Q
+          )
+          [ "$n" = "ACME-SECRET" ] || { echo "::error::cross-tenant TOTP secret visible: got '$n'"; exit 1; }
+
+          echo "--- mfa: and only its own recovery codes"
+          n=$(app <<'Q'
+          BEGIN;
+          SET LOCAL app.current_tenant_id = '11111111-1111-1111-1111-111111111111';
+          SELECT string_agg(code_hash, ',') FROM shared.mfa_recovery_codes;
+          COMMIT;
+          Q
+          )
+          [ "$n" = "acme-hash" ] || { echo "::error::cross-tenant recovery codes visible: got '$n'"; exit 1; }
+
+          echo "--- mfa: a tenant cannot burn another tenant's recovery code"
+          # Burning someone else's codes is a denial-of-access attack: it does
+          # not grant entry, it removes their way back in after losing a phone.
+          n=$(app <<'Q'
+          BEGIN;
+          SET LOCAL app.current_tenant_id = '11111111-1111-1111-1111-111111111111';
+          UPDATE shared.mfa_recovery_codes SET used_at = now() WHERE code_hash = 'globex-hash';
+          SELECT count(*) FROM shared.mfa_recovery_codes WHERE used_at IS NOT NULL;
+          COMMIT;
+          Q
+          )
+          [ "$n" = "0" ] || { echo "::error::a tenant burned another tenant's recovery code"; exit 1; }
+
+          echo "--- SET LOCAL does not leak onto a pooled connection"
+          n=$(printf 'SELECT count(*) FROM shared.secrets;\n' | app)
+          [ "$n" = "0" ] || { echo "::error::tenant scope leaked past its transaction"; exit 1; }
+
+          echo "tenant isolation verified"
+
+      - name: Editing an applied migration is rejected
+        env:
+          PGHOST: localhost
+          PGPORT: '5432'
+          PGUSER: vyltzero
+          PGDATABASE: vyltzero
+          PGPASSWORD: testpassword
+          BASELINE_ON_EXISTING: 'true'
+          SQL_DIR: /tmp/migrations
+        run: |
+          echo '-- tampered' >> /tmp/migrations/007_regions.sql
+          if sh /tmp/migrations/migrate.sh; then
+            echo "::error::a modified migration was accepted; drift detection is broken"
+            exit 1
+          fi
+          echo "drift correctly rejected"
