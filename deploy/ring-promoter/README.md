@@ -33,7 +33,7 @@ Each ring has its **own** PostgreSQL and its **own** key material, so a token or
 ciphertext from one ring is useless in another.
 
 Traffic: `<host>.vyltzero.com` (Cloudflare DNS-only CNAME) → `lon1.pop0.uk` (WSLProxy,
-terminates TLS) → cloud001 traefik-edge `72.62.211.28:80` → vault-ui (`/`) and the
+terminates TLS) → vps002 traefik-edge `85.190.106.88:80` → vault-ui (`/`) and the
 service route map (`/v1/*`) on the same host.
 
 ## Files

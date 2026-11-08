@@ -803,6 +803,13 @@ postgresql:
       adminPasswordKey: postgres-password
       userPasswordKey: password
   primary:
+    # -- OFF: templates/networkpolicies.yaml already ships the
+    # vyltzero-postgresql policy (ingress from this release's services only).
+    # Bitnami 16.x renders its own policy under the SAME name, and a fresh
+    # install then fails with `networkpolicies "vyltzero-postgresql" already
+    # exists`.
+    networkPolicy:
+      enabled: false
     persistence:
       enabled: true
       size: 10Gi

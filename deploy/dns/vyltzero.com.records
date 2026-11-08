@@ -4,7 +4,7 @@
 # name                 type   content            proxied
 #
 # Vault rings: DNS-only CNAMEs to the WSLProxy edge, which terminates TLS and
-# routes to cloud001 traefik-edge (deploy/wslproxy/). Must stay proxied=false:
+# routes to vps002 traefik-edge (deploy/wslproxy/). Must stay proxied=false:
 # a Cloudflare-proxied record breaks the edge's ACME + Ring Promoter health.
 int.vyltzero.com       CNAME  lon1.pop0.uk       false
 test.vyltzero.com      CNAME  lon1.pop0.uk       false

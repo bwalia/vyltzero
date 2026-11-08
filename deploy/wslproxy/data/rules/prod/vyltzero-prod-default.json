@@ -17,12 +17,12 @@
         "mode": "least_conn"
       },
       "is_consul": false,
-      "redirect_uri": "72.62.211.28:80",
+      "redirect_uri": "85.190.106.88:80",
       "backends": [
         {
-          "address": "72.62.211.28:80",
+          "address": "85.190.106.88:80",
           "weight": 100,
-          "label": "cloud001-traefik-edge-origin"
+          "label": "vps002-traefik-edge-origin"
         }
       ]
     },

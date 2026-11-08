@@ -11,7 +11,7 @@
 # Traffic path (same as the rest of the platform):
 #   browser -> <host>.vyltzero.com (Cloudflare, DNS-only CNAME)
 #           -> lon1.pop0.uk (WSLProxy edge, terminates TLS)
-#           -> cloud001 traefik-edge :80 (72.62.211.28)
+#           -> vps002 traefik-edge :80 (85.190.106.88)
 #           -> vault-ui  (/)          — also reverse-proxies the console's API calls
 #           -> services  (/v1/*, ...) — edgeIngress route map, same host
 #
@@ -23,15 +23,46 @@ global:
   # pinned below.
   security:
     allowInsecureImages: true
-  # Placement: the chart default already pins the whole release to cloud001
-  # (the edge PoP origin) with the edge toleration and the cloud001 flannel
-  # /31 for the edge host-ingress NetworkPolicies. Every ring shares that.
+  # Placement: every ring runs on vps002, an edge PoP origin with its own
+  # host-network traefik-edge (public 85.190.106.88:80). Edge nodes cannot
+  # reach pods on other nodes, so the WHOLE release — Postgres included —
+  # must share the node its edge traffic lands on. (cloud001, the chart
+  # default, is ~98% CPU-requested by the WSLVault regions.)
+  scheduling:
+    nodeSelector: &ringNode
+      kubernetes.io/hostname: vps002
+    tolerations: &ringTolerations
+      - key: node-role.kubernetes.io/edge
+        operator: Exists
+        effect: NoSchedule
+    affinity: {}
+  # vps002 podCIDR 10.42.17.0/24 -> flannel host /31. Feeds the edge
+  # host-ingress NetworkPolicies below (anchors in values.yaml do not cross
+  # files, so each consumer is set explicitly).
+  edgeHostCidrs: &ringEdgeCidrs
+    - 10.42.17.0/31
+
+networkPolicies:
+  wslproxyHostIngress:
+    cidrs: *ringEdgeCidrs
 
 ui:
   enabled: true
   replicaCount: 1
   ingressClassName: traefik-edge
   entrypoint: web,websecure
+  wslproxyIngress:
+    cidrs: *ringEdgeCidrs
+
+# One replica per service: a ring is a single node, so extra replicas add
+# CPU requests without adding availability. (cryptoService MUST stay 1.)
+secretEngine:   { replicaCount: 1 }
+policyEngine:   { replicaCount: 1 }
+leaseManager:   { replicaCount: 1 }
+auditService:   { replicaCount: 1 }
+transitEngine:  { replicaCount: 1 }
+pkiEngine:      { replicaCount: 1 }
+mcpServer:      { replicaCount: 1 }
 
 edgeIngress:
   enabled: true
@@ -85,9 +116,5 @@ postgresql:
     persistence:
       storageClass: local-path
       size: 8Gi
-    nodeSelector:
-      kubernetes.io/hostname: cloud001
-    tolerations:
-      - key: node-role.kubernetes.io/edge
-        operator: Exists
-        effect: NoSchedule
+    nodeSelector: *ringNode
+    tolerations: *ringTolerations
