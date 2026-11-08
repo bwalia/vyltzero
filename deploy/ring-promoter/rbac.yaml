@@ -1,17 +1,15 @@
-# RBAC so Ring Promoter's k8sjob runner can helm-deploy VyltZero on k3s1.
+# RBAC so Ring Promoter's k8sjob runner can helm-deploy VYLTZERO on k3s1.
 #
-# Apply against k3s1 (once):
+# Apply against k3s1 (once; scripts/vyltzero-env-bootstrap.sh does this too):
 #   export KUBECONFIG=~/.kube/k3s1.yaml
 #   kubectl apply -f deploy/ring-promoter/rbac.yaml
 #
-# Assumes the shared platform already exists (owned by ring-promoter /
-# diy-tax-return-uk, not this file):
-#   * namespace ring-exec
-#   * ServiceAccount ring-exec/ring-deploy-job
+# Assumes the shared platform already exists (owned by ring-promoter, not
+# this file): namespace ring-exec and ServiceAccount ring-exec/ring-deploy-job.
 #
-# This file adds namespaced helm-deploy rights in the two HA region
-# namespaces (vyltzero = region-a, vyltzero-b = region-b). Namespaces are
-# NOT created here — they already run the live releases.
+# Grants namespaced helm-deploy rights in the four ring namespaces
+# vyltzero-{int,test,acc,prod}. The namespaces themselves are created by
+# scripts/vyltzero-env-bootstrap.sh, so they must exist before this applies.
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -55,7 +53,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: rp-deploy-vyltzero
-  namespace: vyltzero
+  namespace: vyltzero-int
   labels:
     app.kubernetes.io/part-of: vyltzero
 subjects:
@@ -71,7 +69,39 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: rp-deploy-vyltzero
-  namespace: vyltzero-b
+  namespace: vyltzero-test
+  labels:
+    app.kubernetes.io/part-of: vyltzero
+subjects:
+  - kind: ServiceAccount
+    name: ring-deploy-job
+    namespace: ring-exec
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rp-deploy-vyltzero
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rp-deploy-vyltzero
+  namespace: vyltzero-acc
+  labels:
+    app.kubernetes.io/part-of: vyltzero
+subjects:
+  - kind: ServiceAccount
+    name: ring-deploy-job
+    namespace: ring-exec
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rp-deploy-vyltzero
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rp-deploy-vyltzero
+  namespace: vyltzero-prod
   labels:
     app.kubernetes.io/part-of: vyltzero
 subjects:

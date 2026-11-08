@@ -1,0 +1,16 @@
+# Cloudflare DNS for vyltzero.com — applied by .github/workflows/dns.yml
+# (idempotent upsert via scripts/cloudflare-dns.sh).
+#
+# name                 type   content            proxied
+#
+# Vault rings: DNS-only CNAMEs to the WSLProxy edge, which terminates TLS and
+# routes to cloud001 traefik-edge (deploy/wslproxy/). Must stay proxied=false:
+# a Cloudflare-proxied record breaks the edge's ACME + Ring Promoter health.
+int.vyltzero.com       CNAME  lon1.pop0.uk       false
+test.vyltzero.com      CNAME  lon1.pop0.uk       false
+acc.vyltzero.com       CNAME  lon1.pop0.uk       false
+app.vyltzero.com       CNAME  lon1.pop0.uk       false
+# Marketing site (www/, GitHub Pages via .github/workflows/pages.yml). The
+# apex CNAME is served by Cloudflare CNAME flattening; Pages redirects it to www.
+www.vyltzero.com       CNAME  bwalia.github.io   false
+vyltzero.com           CNAME  bwalia.github.io   false

@@ -1,0 +1,93 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Shared overlay for every VYLTZERO ring on k3s1 (int / test / acc / prod).
+#
+# Layered as:  values.yaml  ->  values-k3s1.yaml  ->  values-<env>.yaml
+#
+# Each ring is ONE self-contained, single-region release in its own namespace
+# (vyltzero-<env>) with its OWN PostgreSQL and its OWN key material. Rings
+# never share keys: a token or ciphertext minted in int is meaningless in
+# prod, which is exactly the isolation we want between environments.
+#
+# Traffic path (same as the rest of the platform):
+#   browser -> <host>.vyltzero.com (Cloudflare, DNS-only CNAME)
+#           -> lon1.pop0.uk (WSLProxy edge, terminates TLS)
+#           -> cloud001 traefik-edge :80 (72.62.211.28)
+#           -> vault-ui  (/)          — also reverse-proxies the console's API calls
+#           -> services  (/v1/*, ...) — edgeIngress route map, same host
+#
+# Secrets never live in Git. Before a ring's first deploy run:
+#   ./scripts/vyltzero-env-bootstrap.sh <env>
+# ═══════════════════════════════════════════════════════════════════════════
+global:
+  # Required by the PostgreSQL subchart to accept the bitnamilegacy repository
+  # pinned below.
+  security:
+    allowInsecureImages: true
+  # Placement: the chart default already pins the whole release to cloud001
+  # (the edge PoP origin) with the edge toleration and the cloud001 flannel
+  # /31 for the edge host-ingress NetworkPolicies. Every ring shares that.
+
+ui:
+  enabled: true
+  replicaCount: 1
+  ingressClassName: traefik-edge
+  entrypoint: web,websecure
+
+edgeIngress:
+  enabled: true
+  ingressClassName: traefik-edge
+  entrypoint: web,websecure
+  extraHosts: []
+
+# Single-region rings: no peers to replicate with and nothing to fail over to.
+replicationAgent:
+  enabled: false
+regionHealth:
+  # Kept: the console's Regions/Cluster pages and /api/version read it.
+  replicaCount: 1
+syncScheduler:
+  replicaCount: 1
+
+# traefik-edge is the edge; the OpenResty gateway is not deployed.
+gateway:
+  enabled: false
+
+identityService:
+  replicaCount: 1
+  # Invitation email is OFF until an SMTP password is provisioned into the
+  # ring's vyltzero-mesh-keys Secret (key smtp-password). Invitations are still
+  # created; the link is returned to the operator to deliver by hand.
+  smtp:
+    host: ""
+
+cryptoService:
+  replicaCount: 1
+
+secrets:
+  # vyltzero-mesh-keys is created per ring by scripts/vyltzero-env-bootstrap.sh.
+  existingSecret: vyltzero-mesh-keys
+
+postgresql:
+  enabled: true
+  image:
+    registry: docker.io
+    repository: bitnamilegacy/postgresql
+  auth:
+    database: vyltzero
+    username: vyltzero
+    # Created OUTSIDE the chart by scripts/vyltzero-env-bootstrap.sh so the
+    # password survives helm uninstall/upgrade (see deploy/gitops/README.md).
+    existingSecret: vyltzero-db-auth
+    secretKeys:
+      adminPasswordKey: postgres-password
+      userPasswordKey: password
+  primary:
+    persistence:
+      storageClass: local-path
+      size: 8Gi
+    nodeSelector:
+      kubernetes.io/hostname: cloud001
+    tolerations:
+      - key: node-role.kubernetes.io/edge
+        operator: Exists
+        effect: NoSchedule

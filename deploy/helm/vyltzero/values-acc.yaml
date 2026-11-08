@@ -1,0 +1,27 @@
+# VYLTZERO ring: acc  ->  https://acc.vyltzero.com
+# Namespace vyltzero-acc on k3s1. Layered on values-k3s1.yaml.
+# Deployed by Ring Promoter (deploy/ring-promoter/vyltzero.yaml); image tags
+# are set by the deploy job to the promoted release (vX.Y.Z), not here.
+global:
+  # NetworkPolicy cross-namespace selectors key off this; must match the
+  # namespace the release is installed into.
+  namespace: vyltzero-acc
+  region:
+    id: acc
+    displayName: "ACC"
+    endpoint: https://acc.vyltzero.com
+    peers: []
+
+ui:
+  host: acc.vyltzero.com
+
+edgeIngress:
+  host: acc.vyltzero.com
+  tls:
+    secretName: vyltzero-gateway-tls
+    hosts:
+      - acc.vyltzero.com
+
+identityService:
+  # Where invitation links point — the address the recipient opens.
+  publicUrl: "https://acc.vyltzero.com"

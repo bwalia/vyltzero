@@ -1,24 +1,24 @@
-# Ring Promoter app config — helm-deploy VyltZero HA regions on k3s1.
+# Ring Promoter app — VYLTZERO on k3s1, four rings: int → test → acc → prod.
 #
-# Paste the `apps:` entry into the workstation Ring Promoter ConfigMap
-# (ring-promoter repo: deploy/k8s/configmap.yaml → namespace
-# workstation-ring-promoter), then:
-#   kubectl apply -f deploy/ring-promoter/rbac.yaml
-#   kubectl apply -f <configmap>
-#   kubectl rollout restart deploy/ring-promoter -n workstation-ring-promoter
+# The "GitHub workflows + Ring Promoter" combo:
+#   1. .github/workflows/ci.yml (GitHub-hosted) tests, builds every image,
+#      pushes them to GHCR + Docker Hub, cuts the vX.Y.Z tag, then seeds this
+#      app's `int` ring with that tag (job `seed-ring-promoter`).
+#   2. Ring Promoter runs the k8sjob below IN-CLUSTER for each ring: clone the
+#      tag, `helm upgrade --install` into vyltzero-<env>, then health-check the
+#      public /api/version until it reports the seeded tag.
+#   3. int and test auto-promote; acc → prod is a deliberate human promote in
+#      https://rp.workstation.co.uk/?app=vyltzero.
+#   4. .github/workflows/dns.yml keeps the Cloudflare records; the WSLProxy
+#      vhosts live in deploy/wslproxy/ (scripts/wslproxy-register.sh).
 #
-# Pipeline (matches Argo sync waves: A then B):
-#   int  → region-a (vyltzero / cloud001 / Manchester)
-#   test → region-b (vyltzero-b / cloud003 / London)
-# Seed int after a release tag; with auto_promote on int, RP continues to test.
+# The k8sjob deployer (not github) is deliberate: the k3s API is LAN-only and
+# this repo has no self-hosted runner, so the cluster deploys itself.
 #
-# Version = a git tag (v1.0.x). The k8sjob clones this public repo at that tag
-# and helm-upgrades with every image pin overridden to RP_VERSION.
-#
-# Requires: ring-exec + ring-deploy-job SA (shared platform), rbac.yaml applied.
+# One-time bootstrap: see deploy/ring-promoter/README.md.
 apps:
   - name: vyltzero
-    display_name: "VyltZero (k3s1 HA)"
+    display_name: "VYLTZERO — the vault for AI agents"
     location: { lat: 53.4808, lng: -2.2426, city: Manchester, region: GB }
     deployer: k8sjob
     k8sjob:
@@ -26,7 +26,7 @@ apps:
       image: docker.io/dtzar/helm-kubectl:3.15.4
       service_account: ring-deploy-job
       # CNI overlay egress to github.com is flaky on some nodes; hostNetwork
-      # uses the node's path (same as jobshout).
+      # uses the node's own path (same as jobshout / wslvault).
       host_network: true
       command: ["/bin/sh", "-c"]
       args:
@@ -35,20 +35,10 @@ apps:
           env="${RP_TARGET_ENV}"
           ver="${RP_VERSION}"
           case "${env}" in
-            region-a)
-              ns="vyltzero"
-              values="deploy/gitops/regions/region-a.values.yaml"
-              ;;
-            region-b)
-              ns="vyltzero-b"
-              values="deploy/gitops/regions/region-b.values.yaml"
-              ;;
-            *)
-              echo "unknown RP_TARGET_ENV=${env} (expected region-a|region-b)"
-              exit 1
-              ;;
+            int|test|acc|prod) ns="vyltzero-${env}" ;;
+            *) echo "unknown RP_TARGET_ENV=${env} (expected int|test|acc|prod)"; exit 1 ;;
           esac
-          echo "deploy vyltzero ${ver} -> ns ${ns} (${env}, ring ${RP_RING})"
+          echo "deploy vyltzero ${ver} -> ns ${ns} (ring ${RP_RING})"
           rm -rf /src
           n=0
           until git clone --depth 1 --branch "${ver}" https://github.com/bwalia/vyltzero /src; do
@@ -57,27 +47,21 @@ apps:
             echo "git clone failed (attempt $n), retrying..."
             sleep $((n*5))
           done
-          cd /src
-          # Region values pin explicit per-service tags; --set overrides all of
-          # them plus global.imageTag so lease-manager / sync-scheduler (which
-          # fall back to global) cannot lag behind.
-          # No --create-namespace: vyltzero / vyltzero-b already exist; the
-          # ring-deploy-job SA has no cluster-scoped namespace rights.
-          helm upgrade --install vyltzero ./deploy/helm/vyltzero \
+          cd /src/deploy/helm/vyltzero
+          # Refuse to deploy into a ring that was never bootstrapped: without
+          # these Secrets the pods crash-loop and helm --wait burns 15 minutes.
+          for s in vyltzero-mesh-keys vyltzero-db-auth; do
+            kubectl -n "${ns}" get secret "${s}" >/dev/null \
+              || { echo "missing Secret ${ns}/${s} — run scripts/vyltzero-env-bootstrap.sh ${env}"; exit 1; }
+          done
+          # Ring values never pin per-service tags, so global.imageTag moves
+          # every service together. No --create-namespace: the ring-deploy-job
+          # SA has no cluster-scoped rights; bootstrap creates the namespace.
+          helm upgrade --install vyltzero . \
             --namespace "${ns}" \
-            -f "${values}" \
+            -f values-k3s1.yaml \
+            -f "values-${env}.yaml" \
             --set global.imageTag="${ver}" \
-            --set ui.image.tag="${ver}" \
-            --set identityService.image.tag="${ver}" \
-            --set regionHealth.image.tag="${ver}" \
-            --set secretEngine.image.tag="${ver}" \
-            --set policyEngine.image.tag="${ver}" \
-            --set transitEngine.image.tag="${ver}" \
-            --set auditService.image.tag="${ver}" \
-            --set pkiEngine.image.tag="${ver}" \
-            --set mcpServer.image.tag="${ver}" \
-            --set cryptoService.image.tag="${ver}" \
-            --set replicationAgent.image.tag="${ver}" \
             --wait --timeout 15m
           echo "vyltzero ${ver} live in ${ns}"
       resources: { cpu_request: 100m, memory_limit: 512Mi }
@@ -85,17 +69,32 @@ apps:
       retries: 0
       ttl_after_finished: 1h
     rings:
-      # Wave 0 — Manchester. Auto-promote onward so a seed rolls London too.
       int:
-        target_env: region-a
-        display_name: "region-a · Manchester"
-        health_url: "https://vault.workstation.co.uk/api/version"
+        target_env: int
+        display_name: "int · int.vyltzero.com"
+        health_url: "https://int.vyltzero.com/api/version"
         health_version_field: version
         auto_promote: true
-      # Wave 1 — London. Stop here; higher rings are unused for this app.
+        links: [ { label: "VyltZero int", url: "https://int.vyltzero.com/" } ]
       test:
-        target_env: region-b
-        display_name: "region-b · London"
-        health_url: "https://vault-ha.workstation.co.uk/api/version"
+        target_env: test
+        display_name: "test · test.vyltzero.com"
+        health_url: "https://test.vyltzero.com/api/version"
+        health_version_field: version
+        auto_promote: true
+        links: [ { label: "VyltZero test", url: "https://test.vyltzero.com/" } ]
+      # acc -> prod is a human decision: auto_promote stops here.
+      acc:
+        target_env: acc
+        display_name: "acc · acc.vyltzero.com"
+        health_url: "https://acc.vyltzero.com/api/version"
         health_version_field: version
         auto_promote: false
+        links: [ { label: "VyltZero acc", url: "https://acc.vyltzero.com/" } ]
+      prod:
+        target_env: prod
+        display_name: "prod · app.vyltzero.com"
+        health_url: "https://app.vyltzero.com/api/version"
+        health_version_field: version
+        auto_promote: false
+        links: [ { label: "VyltZero", url: "https://app.vyltzero.com/" } ]

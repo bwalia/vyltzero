@@ -411,10 +411,11 @@ jobs:
   # ─── seed Ring Promoter with the tagged version ────────────────────
   # Same pattern as jobshout: CI builds + tags, then seeds int on
   # https://rp.workstation.co.uk. RP's k8sjob clones this repo at the tag and
-  # helm-upgrades region-a; auto_promote carries the version to region-b.
+  # helm-upgrades vyltzero-int; auto_promote carries it on to test and acc.
+  # acc -> prod is a deliberate promote in the RP UI.
   # The seed carries vX.Y.Z, never a commit SHA — `git clone --branch` needs a tag.
   seed-ring-promoter:
-    name: Seed Ring Promoter (int → region-a)
+    name: Seed Ring Promoter (int)
     needs: [compute-version, auto-tag]
     if: needs.auto-tag.outputs.tag_ready == 'true'
     runs-on: ubuntu-latest
@@ -497,7 +498,7 @@ jobs:
                       sys.exit(1)
                   if not current:
                       print("::warning::RP did not return current_version; trusting job success")
-                  print(f"Deployed {tag} to int (region-a); auto_promote should roll region-b")
+                  print(f"Deployed {tag} to int; auto_promote rolls test then acc")
                   print(f"current_version={current or tag}")
                   sys.exit(0)
               if status in ("failed", "failure", "error"):
