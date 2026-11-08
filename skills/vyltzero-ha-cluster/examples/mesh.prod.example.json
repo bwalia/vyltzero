@@ -1,0 +1,35 @@
+{
+  "env": "prod",
+  "alias": "app.vyltzero.com",
+  "release": "vyltzero",
+  "chart": "deploy/helm/vyltzero",
+  "base_values": [
+    "values-k3s1.yaml",
+    "values-prod.yaml"
+  ],
+  "public_url": "https://app.vyltzero.com",
+  "secret_name": "vyltzero-mesh-keys",
+  "publish_peer_endpoint": false,
+  "regions": [
+    {
+      "id": "prod",
+      "display_name": "prod",
+      "namespace": "vyltzero-prod",
+      "node": "vps002",
+      "host": "app-a.vyltzero.com",
+      "primary": true,
+      "origin": "85.190.106.88",
+      "edge_cidr": "10.42.17.0/31"
+    },
+    {
+      "id": "prod-b",
+      "display_name": "prod-b",
+      "namespace": "vyltzero-prod-b",
+      "node": "cloud003",
+      "host": "app-b.vyltzero.com",
+      "primary": false,
+      "origin": "77.68.126.63",
+      "edge_cidr": "10.42.0.0/31"
+    }
+  ]
+}

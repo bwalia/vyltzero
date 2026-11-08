@@ -8,12 +8,18 @@ the open [Agent Skills](https://agentskills.io) format: a folder holding a
 | Skill | What it does |
 |---|---|
 | [`vyltzero-secrets`](vyltzero-secrets/SKILL.md) | Adds secrets for a tenant's apps, services and DTAP environments (INT/TEST/ACC/PROD). Creates the tenant, or attaches to an existing tenant with the same name. Every change needs MFA and a typed approval, and every run can be rolled back. |
+| [`vyltzero-ha-cluster`](vyltzero-ha-cluster/SKILL.md) | Builds a multi-region, active/active HA mesh on Kubernetes for a vyltzero.com environment. Plans regions from live node facts, checks nodes, DNS and edge, shares mesh keys safely (copied from the region that holds data, never over it), renders and validates per-region Helm values, bootstraps, deploys primary-first and verifies replication. |
+| [`vyltzero-ha-failover`](vyltzero-ha-failover/SKILL.md) | Operates the mesh: shows which region serves `app.vyltzero.com`, switches or fails over traffic with a typed `FAILOVER <alias> TO <region>` approval, fails back, runs DR drills, rejoins rebuilt regions and rotates the peer token. Needs `vyltzero-ha-cluster` installed alongside. |
 
 ## Install
 
 A skill is a folder. Installing it means copying the folder to a place where
 your agent looks for skills. Copy the **whole folder**, not only `SKILL.md`,
-because the skill runs its bundled `scripts/wsv.py`.
+because each skill runs its bundled scripts (`vyltzero-secrets` runs
+`scripts/wsv.py`; the HA skills run `vyltzero-ha-cluster/scripts/vz_ha.py`).
+The HA skills operate a checkout of this repository, so the simplest install
+is a symlink: `ln -s "$PWD/skills/vyltzero-ha-cluster" ~/.claude/skills/`
+(and the same for `vyltzero-ha-failover`).
 
 ```bash
 # Pick the directory for your agent:
