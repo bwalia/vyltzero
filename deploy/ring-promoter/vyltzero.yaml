@@ -9,8 +9,8 @@
 #      public /api/version until it reports the seeded tag.
 #   3. int and test auto-promote; acc → prod is a deliberate human promote in
 #      https://rp.workstation.co.uk/?app=vyltzero.
-#   4. .github/workflows/dns.yml keeps the Cloudflare records; the WSLProxy
-#      vhosts live in deploy/wslproxy/ (scripts/wslproxy-register.sh).
+#   4. Each ring host is NS-delegated to ns1/ns2.nebuladns.net with lon1 <-> lon2
+#      DNS failover; WSLProxy vhosts live on cp.pop0.uk (see README.md).
 #
 # The k8sjob deployer (not github) is deliberate: the k3s API is LAN-only and
 # this repo has no self-hosted runner, so the cluster deploys itself.

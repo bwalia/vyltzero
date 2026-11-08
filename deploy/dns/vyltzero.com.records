@@ -3,13 +3,14 @@
 #
 # name                 type   content            proxied
 #
-# Vault rings: DNS-only CNAMEs to the WSLProxy edge, which terminates TLS and
-# routes to vps002 traefik-edge (deploy/wslproxy/). Must stay proxied=false:
-# a Cloudflare-proxied record breaks the edge's ACME + Ring Promoter health.
-int.vyltzero.com       CNAME  lon1.pop0.uk       false
-test.vyltzero.com      CNAME  lon1.pop0.uk       false
-acc.vyltzero.com       CNAME  lon1.pop0.uk       false
-app.vyltzero.com       CNAME  lon1.pop0.uk       false
+# NOT here — the vault rings int/test/acc/app.vyltzero.com. Each is an NS
+# delegation to ns1/ns2.nebuladns.net with health-driven lon1 <-> lon2 DNS
+# failover (nebula-dns-failover). Owned by bwalia/diy-tax-return-infra:
+#   scripts/nebuladns-cloudflare-dns.py      Cloudflare NS delegation
+#   ansible/files/zones/<host>.toml          NebulaDNS zones (apex A, TTL 30)
+#   ansible/files/nebuladns/dns-failover.toml  failover controller hostnames
+# Never add a CNAME/A for those names here: it would collide with the NS.
+#
 # Marketing site (www/, GitHub Pages via .github/workflows/pages.yml). The
 # apex CNAME is served by Cloudflare CNAME flattening; Pages redirects it to www.
 www.vyltzero.com       CNAME  bwalia.github.io   false

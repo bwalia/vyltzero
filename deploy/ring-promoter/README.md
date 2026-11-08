@@ -32,9 +32,36 @@ Every ring runs the **same tag and the same images**; nothing is rebuilt between
 Each ring has its **own** PostgreSQL and its **own** key material, so a token or
 ciphertext from one ring is useless in another.
 
-Traffic: `<host>.vyltzero.com` (Cloudflare DNS-only CNAME) → `lon1.pop0.uk` (WSLProxy,
-terminates TLS) → vps002 traefik-edge `85.190.106.88:80` → vault-ui (`/`) and the
-service route map (`/v1/*`) on the same host.
+## Traffic and failover
+
+```
+<ring>.vyltzero.com
+  Cloudflare (vyltzero.com zone): NS -> ns1.nebuladns.net / ns2.nebuladns.net
+  NebulaDNS (cloud001 / vps002):  apex A, TTL 30 -> lon1 195.20.255.201
+                                                 or lon2 85.190.106.189
+  nebula-dns-failover (on ns1 AND ns2) probes lon1/lon2 /healthz every 10s and
+  rewrites the A record: 3 failures -> lon2, 3 OKs + 30s -> back to lon1
+  lon1 / lon2 (WSLProxy, own Let's Encrypt certs on each, TLS terminated)
+  -> vps002 traefik-edge 85.190.106.88:80 -> vault-ui (/) + services (/v1/*)
+```
+
+Clients follow a failover after ~2-3 x TTL (60-90 s). Both POPs hold valid
+certificates for every ring host (issued 2026-11-08 by forcing each host onto lon2).
+
+| Layer | Source of truth |
+|-------|-----------------|
+| Cloudflare NS delegation | `diy-tax-return-infra/scripts/nebuladns-cloudflare-dns.py` (`vyltzero.com` block) |
+| NebulaDNS zones | `diy-tax-return-infra/ansible/files/zones/<ring>.vyltzero.com.toml` (`ansible/nebuladns.yml`) |
+| Failover hostnames | `diy-tax-return-infra/ansible/files/nebuladns/dns-failover.toml` |
+| WSLProxy vhosts + rule `vyltzero-vps002-traefik-edge` | `cp.pop0.uk` (imported), live on lon1, mirrored to lon2; git via the wslproxy CP-sync PRs |
+| www + apex (marketing) | `../dns/vyltzero.com.records` (`.github/workflows/dns.yml`) |
+
+Break-glass (run on ns1 **and** ns2; the token is in `/etc/nebuladns/dns-failover.env`):
+
+```sh
+curl -s -X POST -H "Authorization: Bearer $FAILOVER_API_TOKEN" 127.0.0.1:9119/v1/hostnames/app.vyltzero.com/failover  # force lon2
+curl -s -X POST -H "Authorization: Bearer $FAILOVER_API_TOKEN" 127.0.0.1:9119/v1/hostnames/app.vyltzero.com/auto      # back to health-driven
+```
 
 ## Files
 
@@ -45,8 +72,7 @@ service route map (`/v1/*`) on the same host.
 | [`vyltzero-www.yaml`](vyltzero-www.yaml) | Optional RP app for the marketing site (`deployer: github`) |
 | `../helm/vyltzero/values-k3s1.yaml` | Shared overlay for every ring |
 | `../helm/vyltzero/values-<env>.yaml` | Per-ring host, namespace, region id |
-| `../wslproxy/data/` | Edge vhosts + routing rule (`scripts/wslproxy-register.sh`) |
-| `../dns/vyltzero.com.records` | Cloudflare records (`.github/workflows/dns.yml`) |
+| `../dns/vyltzero.com.records` | Cloudflare records for www + apex (`.github/workflows/dns.yml`) |
 
 ## One-time setup
 
@@ -56,10 +82,22 @@ export KUBECONFIG=~/.kube/k3s1.yaml
 # 1. Namespaces, per-ring keys + DB credentials, RP RoleBindings (idempotent)
 ./scripts/vyltzero-env-bootstrap.sh all
 
-# 2. Edge vhosts (LAN only — the control plane is not reachable from GitHub)
-./scripts/wslproxy-register.sh
+# 2. Edge vhosts on lon1 + lon2 + cp.pop0.uk (from a bwalia/wslproxy checkout).
+#    The first host creates the shared rule; the rest reuse it with --rule-id.
+#    Skip the skill's dns step: these names are NebulaDNS delegations.
+.claude/skills/wslproxy-add-domain/scripts/add_domain.py --host int.vyltzero.com \
+  --backend 85.190.106.88:80 --upstream-host int.vyltzero.com \
+  --rule-name vyltzero-vps002-traefik-edge --steps preflight,generate,lon1,lon2,cp
+#    Then write /opt/nginx/data/ssl/<host>.json on lon1 AND lon2 and reload
+#    openresty: add_domain.py writes files over ssh, which skips the edge's
+#    SSL wire-up, so auto-ssl refuses the domain ("domain not allowed").
 
-# 3. Register the app: append the `apps:` item from vyltzero.yaml to
+# 3. DNS failover (bwalia/diy-tax-return-infra): zone file + hostname entry,
+#    ansible-playbook nebuladns.yml -e nebuladns_version=<live version>, copy
+#    dns-failover.toml to ns1/ns2, then
+#    python3 scripts/nebuladns-cloudflare-dns.py --zone vyltzero.com
+
+# 4. Register the app: append the `apps:` item from vyltzero.yaml to
 #    workstation-ring-promoter/ring-promoter-config (data.config.yaml), then
 kubectl rollout restart deploy/ring-promoter -n workstation-ring-promoter
 ```
