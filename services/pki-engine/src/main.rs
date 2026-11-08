@@ -42,7 +42,6 @@ use axum::{
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use utoipa::OpenApi as _;
-use utoipa_swagger_ui::SwaggerUi;
 
 use vyltzero_core::config::DatabaseConfig;
 use vyltzero_storage::pool::DbPool;
@@ -131,7 +130,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Liveness probe (no auth required).
         .route("/health", get(health::health_handler))
         .merge(pki_routes)
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()));
+        .merge(vyltzero_core::openapi::openapi_json_router(
+            ApiDoc::openapi()
+                .to_json()
+                .expect("OpenAPI spec serializes"),
+        ));
 
     let addr = "0.0.0.0:8088".parse::<std::net::SocketAddr>()?;
     info!("HTTP server listening on {}", addr);

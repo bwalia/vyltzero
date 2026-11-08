@@ -45,7 +45,6 @@ use axum::{routing::get, routing::post, Router};
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use utoipa::OpenApi as _;
-use utoipa_swagger_ui::SwaggerUi;
 
 use vyltzero_core::config::DatabaseConfig;
 use vyltzero_storage::pool::DbPool;
@@ -168,9 +167,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Health probe
         .route("/health", get(health::health_handler))
         .merge(transit_routes)
-        // Swagger UI is served at /swagger-ui; the OpenAPI JSON is at
-        // /api-docs/openapi.json for programmatic consumption.
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()));
+        // OpenAPI JSON at /api-docs/openapi.json for programmatic consumption.
+        .merge(vyltzero_core::openapi::openapi_json_router(
+            ApiDoc::openapi()
+                .to_json()
+                .expect("OpenAPI spec serializes"),
+        ));
 
     let addr = "0.0.0.0:8086".parse::<std::net::SocketAddr>()?;
     info!("HTTP server listening on {}", addr);

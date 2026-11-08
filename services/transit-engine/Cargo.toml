@@ -35,7 +35,6 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 utoipa = { workspace = true }
-utoipa-swagger-ui = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

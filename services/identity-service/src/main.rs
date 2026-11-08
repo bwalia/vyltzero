@@ -722,16 +722,15 @@ async fn main() -> Result<(), anyhow::Error> {
     // Build the HTTP router: health probes + tenant CRUD + API key endpoints
     // + SCIM 2.0 provisioning + quota management endpoints.
     //
-    // Swagger UI is served at /swagger-ui (OpenAPI JSON at
-    // /api-docs/openapi.json) for interactive API exploration.
+    // The OpenAPI document is served at /api-docs/openapi.json (no embedded
+    // Swagger UI — see vyltzero_core::openapi for why).
     // SCIM endpoints are excluded from the OpenAPI doc — they follow RFC 7644
     // and are documented separately.
     use utoipa::OpenApi as _;
-    use utoipa_swagger_ui::SwaggerUi;
 
     // Business routes trust tenant-identity headers, so they require
     // gateway-origin authentication (shared X-Gateway-Auth secret). Health
-    // probes and the Swagger docs are intentionally left open.
+    // probes and the OpenAPI document are intentionally left open.
     // Fold optional auth-method routers into the protected route set.
     // Each is `Option<Router>` — absent when the feature is not configured.
     let mut protected_routes: Router = tenant_handlers::router(tenant_store, admin_auth.clone())
@@ -799,7 +798,11 @@ async fn main() -> Result<(), anyhow::Error> {
     ));
 
     let http_app: Router = health::router().merge(protected_routes).merge(
-        SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi::ApiDoc::openapi()),
+        vyltzero_core::openapi::openapi_json_router(
+            openapi::ApiDoc::openapi()
+                .to_json()
+                .expect("OpenAPI spec serializes"),
+        ),
     );
 
     // Shared shutdown channel: either server can trigger graceful shutdown.

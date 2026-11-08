@@ -34,7 +34,6 @@ base64 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 utoipa = { workspace = true }
-utoipa-swagger-ui = { workspace = true }
 
 # Certificate generation and CSR handling.
 # pem: enables from_ca_cert_pem / CertificateSigningRequestParams::from_pem.
@@ -49,4 +48,3 @@ pem = "3"
 # RSA key support
 rsa = { workspace = true }
 # ECDSA P-256 support (for ECDSA CA/leaf keys)
-p256 = { workspace = true }

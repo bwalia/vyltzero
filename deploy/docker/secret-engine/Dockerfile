@@ -37,10 +37,6 @@ RUN case "$(uname -m)" in \
 
 WORKDIR /app
 
-# utoipa-swagger-ui downloads its assets at build time; keep the existing
-# workaround for proxied networks.
-RUN echo "insecure" > /root/.curlrc
-
 # --- manifests first (cheap, rarely change) --------------------------------
 # rust-toolchain.toml is deliberately NOT copied: it would trigger a rustup
 # channel re-sync on every build for a toolchain this image already has.

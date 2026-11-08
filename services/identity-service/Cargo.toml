@@ -46,7 +46,6 @@ ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ri
 # provider for ldap3; the version tracks whatever ldap3/tokio-rustls resolve to.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 utoipa = { workspace = true }
-utoipa-swagger-ui = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

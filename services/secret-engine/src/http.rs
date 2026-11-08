@@ -2081,9 +2081,9 @@ pub async fn list_versions(
 
 /// Build the axum `Router` for the REST API.
 ///
-/// Mounts the Swagger UI at `/swagger-ui` (JSON schema at
-/// `/api-docs/openapi.json`) so operators can explore and test the API
-/// interactively without external tooling.
+/// Publishes the OpenAPI document at `/api-docs/openapi.json` so operators
+/// can explore the API with any OpenAPI viewer (no embedded Swagger UI — see
+/// `vyltzero_core::openapi`).
 ///
 /// Pass the router into the axum `Server` alongside the health router.
 pub fn build_router(
@@ -2095,7 +2095,6 @@ pub fn build_router(
     tenant_pool: Option<vyltzero_storage::pool::DbPool>,
 ) -> Router {
     use utoipa::OpenApi as _;
-    use utoipa_swagger_ui::SwaggerUi;
 
     let app_state = AppState {
         store,
@@ -2133,7 +2132,11 @@ pub fn build_router(
             vyltzero_core::middleware::GatewayAuth::from_env(),
             vyltzero_core::middleware::require_gateway_auth,
         ))
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .merge(vyltzero_core::openapi::openapi_json_router(
+            ApiDoc::openapi()
+                .to_json()
+                .expect("OpenAPI spec serializes"),
+        ))
 }
 
 // ─── Base64 helpers ───────────────────────────────────────────────────────────

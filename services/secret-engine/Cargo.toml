@@ -35,7 +35,6 @@ base64 = { workspace = true }
 jsonwebtoken = { workspace = true }
 prometheus = { workspace = true }
 utoipa = { workspace = true }
-utoipa-swagger-ui = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

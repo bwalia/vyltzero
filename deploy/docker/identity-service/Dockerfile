@@ -12,8 +12,6 @@ COPY services/ services/
 COPY sdks/ sdks/
 COPY vyltzero-cli/ vyltzero-cli/
 COPY proto/ proto/
-# Allow curl to skip SSL verification (needed for utoipa-swagger-ui download behind corporate proxy)
-RUN echo "insecure" > /root/.curlrc
 RUN RUST_TARGET=$(cat /tmp/rust-target) && \
     cargo build --release --target $RUST_TARGET -p identity-service && \
     cp /app/target/$RUST_TARGET/release/identity-service /app/identity-service
